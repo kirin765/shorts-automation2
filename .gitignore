@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# virtualenv
+.venv/
+.venv_win/
+
+# build/output
+output/
+logs/
+
+# local config/secrets
+config.json
+secrets/
+
+# media artifacts
+*.mp3
+*.srt
+*.mp4
+assets/background.mp4
+
+# OS
+.DS_Store
+Thumbs.db
