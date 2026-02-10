@@ -7,13 +7,13 @@ cd shorts
 python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-cp config.example.json config.json
 ```
 
 ### 설정 파일(config.json) 운영 가이드
 
-- `config.example.json`은 **템플릿**이고, 실제 값은 로컬의 `config.json`에 넣습니다.
-- `config.json`은 gitignore 대상이라 **커밋/푸시 금지**입니다.
+- `config.json`은 **선택**입니다. 이제 이 프로젝트는 `config.json` 없이도 실행됩니다(`--config ENV` 기본값).
+- 기본 설정은 `config.example.json`을 사용하고, 민감한 값(API 키 등)은 `.env`(환경변수)로 넣는 것을 권장합니다.
+- `config.json`을 쓰는 경우 gitignore 대상이라 **커밋/푸시 금지**입니다.
 - OAuth 파일도 로컬 전용:
   - `secrets/client_secret.json`
   - `secrets/token.json`
@@ -66,7 +66,7 @@ cp config.example.json config.json
 ## 4) 실행
 렌더만:
 ```bash
-python run_short.py --config config.json --job jobs/today.json --no-upload
+python run_short.py --config ENV --job jobs/today.json --no-upload
 ```
 
 내일 운영용 원커맨드(토픽 생성 + 실행 + 로그 저장):
@@ -81,7 +81,7 @@ NO_UPLOAD=1 ./scripts/run_once.sh --count 1
 
 NO_UPLOAD 환경변수로 업로드 스킵(원커맨드):
 ```bash
-NO_UPLOAD=1 python -u run_short.py --config config.json --job jobs/today.json 2>&1 | tee logs/run_$(date +%Y%m%d_%H%M%S).log
+NO_UPLOAD=1 python -u run_short.py --config ENV --job jobs/today.json 2>&1 | tee logs/run_$(date +%Y%m%d_%H%M%S).log
 ```
 
 산출물 위치:
@@ -93,7 +93,7 @@ NO_UPLOAD=1 python -u run_short.py --config config.json --job jobs/today.json 2>
 
 렌더 + 업로드:
 ```bash
-python run_short.py --config config.json --job jobs/today.json
+python run_short.py --config ENV --job jobs/today.json
 ```
 
 업로드 재시도/타임아웃(선택):
@@ -112,12 +112,12 @@ python run_short.py --config config.json --job jobs/today.json
 
 1) 큐 실행(폴더 내 *.json 순회):
 ```bash
-scripts/run_queue.sh --config config.json --queue-dir jobs/queue
+scripts/run_queue.sh --config ENV --queue-dir jobs/queue
 ```
 
 2) 토픽을 큐에 넣고 바로 실행:
 ```bash
-python scripts/run_daily.py --config config.json --topics-file jobs/topics.txt --count 3 --no-upload
+python scripts/run_daily.py --config ENV --topics-file jobs/topics.txt --count 3 --no-upload
 ```
 
 `jobs/topics.txt`는 "한 줄 = 토픽" 형식입니다.
@@ -127,7 +127,7 @@ python scripts/run_daily.py --config config.json --topics-file jobs/topics.txt -
 ## 토픽 자동 생성(OpenAI)
 아침마다 토픽을 자동 생성해서 `jobs/topics.txt`에 저장할 수 있습니다:
 ```bash
-python3 scripts/generate_topics.py --config config.json --out jobs/topics.txt --count 10
+python3 scripts/generate_topics.py --config ENV --out jobs/topics.txt --count 10
 ```
 생성된 토픽은 `jobs/topics_history.txt`에 누적되어 중복을 최대한 피합니다.
 

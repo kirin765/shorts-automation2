@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 from urllib.parse import quote_plus
 
+from config_loader import ENV_SENTINEL, load_config
+
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 
@@ -48,7 +50,7 @@ def resolve_bin(config: dict, key: str, default: str) -> str:
         return found
     raise RuntimeError(
         f"Required binary not found: {default}. "
-        f"Install it or set `{key}` in config.json to an absolute path."
+        f"Install it or set `{key}` via env/config to an absolute path."
     )
 
 
@@ -457,7 +459,7 @@ def _openai_api_key(config: dict) -> str:
     if not key:
         raise RuntimeError(
             "대본 자동 생성(OpenAI)을 쓰려면 API 키가 필요합니다. "
-            "`config.json`에 `openai_api_key`를 넣거나 환경변수 `OPENAI_API_KEY`를 설정하세요."
+            "환경변수 `OPENAI_API_KEY`를 설정하세요. (또는 config의 `openai_api_key`)"
         )
     return key
 
@@ -885,7 +887,7 @@ def ensure_background_for_job(config: dict, job: Job, *, duration_s: float, out_
     if not api_key:
         raise RuntimeError(
             "background_provider=pexels 인데 Pexels API key가 없습니다. "
-            "`config.json`에 `pexels_api_key`를 넣거나 환경변수 `PEXELS_API_KEY`를 설정하세요."
+            "환경변수 `PEXELS_API_KEY`를 설정하세요. (또는 config의 `pexels_api_key`)"
         )
 
     query = (config.get("pexels_query") or "").strip() or guess_pexels_query(job)
@@ -1614,7 +1616,8 @@ def _print_summary(summary: dict[str, Any]) -> None:
 def main() -> int:
     started = time.monotonic()
     parser = argparse.ArgumentParser(description="YouTube Shorts auto render + upload")
-    parser.add_argument("--config", default="config.json")
+    # ENV means: don't require config.json; load defaults + env overrides instead.
+    parser.add_argument("--config", default=ENV_SENTINEL)
     parser.add_argument("--job", required=True, help="job json path")
     parser.add_argument("--no-upload", action="store_true", help="Skip upload (or set NO_UPLOAD=1)")
     parser.add_argument("--force-upload", action="store_true", help="Upload even if this job was already uploaded")
@@ -1645,7 +1648,7 @@ def main() -> int:
     idempotency_state_file: str | None = None
 
     try:
-        config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+        config = load_config(args.config)
         job = ensure_job_ready(config, load_job(job_path), allow_llm=(not args.no_llm))
 
         out_dir = Path(config.get("output_dir", "output"))
@@ -1703,7 +1706,7 @@ def main() -> int:
                         raise RuntimeError(
                             "TTS 생성에 실패했습니다. Edge TTS와 gTTS 모두 인터넷 연결(DNS/방화벽/프록시)에 의존합니다.\n"
                             "- 네트워크/DNS가 되는지 확인하거나\n"
-                            "- 프록시 환경이면 `config.json`에 `edge_proxy` 또는 환경변수 `EDGE_TTS_PROXY`를 설정하거나\n"
+                            "- 프록시 환경이면 config의 `edge_proxy` 또는 환경변수 `EDGE_TTS_PROXY`를 설정하거나\n"
                             "- 임시로 `--audio`로 기존 음성 파일을 넣어 렌더만 실행하세요.\n"
                             f"Edge TTS 오류: {e}\n"
                             f"gTTS 오류: {e2}"

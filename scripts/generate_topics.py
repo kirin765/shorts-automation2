@@ -9,6 +9,7 @@ from pathlib import Path
 
 import requests
 
+from config_loader import ENV_SENTINEL, load_config
 
 def load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -18,7 +19,7 @@ def openai_key(config: dict) -> str:
     key = (config.get("openai_api_key") or os.environ.get("OPENAI_API_KEY") or "").strip()
     if not key:
         raise SystemExit(
-            "Missing OpenAI API key. Set config.json:openai_api_key or env OPENAI_API_KEY."
+            "Missing OpenAI API key. Set env OPENAI_API_KEY (or config openai_api_key)."
         )
     return key
 
@@ -37,7 +38,7 @@ def read_existing_topics(path: Path) -> set[str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Generate Shorts topics with OpenAI and write jobs/topics.txt")
-    ap.add_argument("--config", default="config.json")
+    ap.add_argument("--config", default=ENV_SENTINEL)
     ap.add_argument("--out", default="jobs/topics.txt")
     ap.add_argument("--history", default="jobs/topics_history.txt")
     ap.add_argument("--count", type=int, default=10)
@@ -47,7 +48,7 @@ def main() -> int:
     ap.add_argument("--avoid-days", type=int, default=60, help="Avoid repeating history within N days (best-effort)")
     args = ap.parse_args()
 
-    cfg = load_json(Path(args.config))
+    cfg = load_config(args.config)
     key = openai_key(cfg)
     base_url = (cfg.get("openai_base_url") or "https://api.openai.com/v1").rstrip("/")
     model = (cfg.get("openai_topic_model") or cfg.get("openai_model") or "gpt-4o-mini").strip()
@@ -162,4 +163,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG="config.json"
+CONFIG="ENV"
 QUEUE_DIR="jobs/queue"
 DONE_DIR="jobs/done"
 FAILED_DIR="jobs/failed"

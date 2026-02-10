@@ -21,7 +21,7 @@ Output:
 EOF
 }
 
-CONFIG="${CONFIG:-config.json}"
+CONFIG="${CONFIG:-ENV}"
 NO_UPLOAD="${NO_UPLOAD:-0}"
 COUNT="${COUNT:-1}"
 TARGET_SECONDS="${TARGET_SECONDS:-28}"
@@ -72,4 +72,3 @@ if [[ -n "$last_result" ]]; then
 fi
 
 exit "$rc"
-

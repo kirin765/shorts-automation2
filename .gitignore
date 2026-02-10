@@ -13,6 +13,8 @@ logs/
 # local config/secrets
 config.json
 secrets/
+.env
+.env.*
 
 # media artifacts
 *.mp3

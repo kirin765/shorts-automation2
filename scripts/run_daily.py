@@ -28,7 +28,7 @@ def read_topics(path: Path) -> list[str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Enqueue topic-only jobs then run the queue.")
-    ap.add_argument("--config", default="config.json")
+    ap.add_argument("--config", default="ENV")
     ap.add_argument("--queue-dir", default="jobs/queue")
     ap.add_argument("--topics-file", help="Text file: 1 topic per line (# comment supported)")
     ap.add_argument("--topic", action="append", help="Repeatable. Adds a single topic.")
@@ -81,4 +81,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
