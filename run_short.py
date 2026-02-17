@@ -1,5 +1,4 @@
 import argparse
-import asyncio
 import json
 import os
 import re
@@ -320,10 +319,6 @@ def write_srt_aligned_openai(
         add_block(i, start, end, text)
     srt_path.write_text("\n".join(blocks), encoding="utf-8")
     return
-
-
-async def tts_edge(text: str, voice: str, out_mp3: Path, *, rate: str = "+0%", pitch: str = "+0Hz") -> None:
-    raise RuntimeError("deprecated: use tts_edge() (subprocess-based) instead")
 
 
 def tts_edge(
