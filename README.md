@@ -9,6 +9,10 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+Python 기준 버전:
+- 로컬/CI 검증 기준은 **Python 3.9** 입니다.
+- 테스트 실행: `python3 -m pytest -q`
+
 ### 설정 파일(config.json) 운영 가이드
 
 - `config.json`은 **선택**입니다. 이제 이 프로젝트는 `config.json` 없이도 실행됩니다(`--config ENV` 기본값).

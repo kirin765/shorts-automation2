@@ -50,7 +50,17 @@ python_cmd() {
     # shellcheck disable=SC1091
     . .venv/bin/activate
   fi
-  python -u run_short.py --config "$CONFIG" --job "$1" $([[ $NO_UPLOAD -eq 1 ]] && echo "--no-upload" || true)
+
+  local py_bin="python"
+  if ! command -v "$py_bin" >/dev/null 2>&1; then
+    py_bin="python3"
+  fi
+  if ! command -v "$py_bin" >/dev/null 2>&1; then
+    echo "python interpreter not found (python/python3)" >&2
+    return 127
+  fi
+
+  "$py_bin" -u run_short.py --config "$CONFIG" --job "$1" $([[ $NO_UPLOAD -eq 1 ]] && echo "--no-upload" || true)
 }
 
 run_job() {
@@ -104,8 +114,14 @@ run_job() {
   echo
 
   shopt -s nullglob
-  mapfile -t jobs < <(ls -1 "$QUEUE_DIR"/*.json 2>/dev/null | sort || true)
+  jobs=("$QUEUE_DIR"/*.json)
   shopt -u nullglob
+
+  if [[ ${#jobs[@]} -gt 0 ]]; then
+    # Keep deterministic order without relying on bash>=4 mapfile/readarray.
+    IFS=$'\n' jobs=($(printf '%s\n' "${jobs[@]}" | sort))
+    unset IFS
+  fi
 
   if [[ ${#jobs[@]} -eq 0 ]]; then
     echo "No jobs in $QUEUE_DIR"

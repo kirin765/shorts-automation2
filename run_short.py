@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 import argparse
-import asyncio
 import json
 import os
 import re
@@ -320,10 +321,6 @@ def write_srt_aligned_openai(
         add_block(i, start, end, text)
     srt_path.write_text("\n".join(blocks), encoding="utf-8")
     return
-
-
-async def tts_edge(text: str, voice: str, out_mp3: Path, *, rate: str = "+0%", pitch: str = "+0Hz") -> None:
-    raise RuntimeError("deprecated: use tts_edge() (subprocess-based) instead")
 
 
 def tts_edge(
@@ -926,27 +923,6 @@ def ensure_background_for_job(config: dict, job: Job, *, duration_s: float, out_
         timeout_s=int(config.get("pexels_timeout_s", 20)),
     )
     return build_background_video_from_clips(config, metas, out_path, duration_s=duration_s)
-
-    ffmpeg = resolve_bin(config, "ffmpeg_bin", "ffmpeg")
-
-    bg.parent.mkdir(parents=True, exist_ok=True)
-    # fallback: dynamic abstract motion background
-    run([
-        ffmpeg,
-        "-y",
-        "-f",
-        "lavfi",
-        "-i",
-        "nullsrc=s=1080x1920:d=40",
-        "-vf",
-        "geq=r='42+18*sin(2*PI*(X/W+T/9))':g='56+18*sin(2*PI*(Y/H+T/8))':b='78+22*sin(2*PI*((X+Y)/(W+H)+T/10))',gblur=sigma=28,eq=saturation=0.72:contrast=1.06:brightness=-0.03,noise=alls=4:allf=t,drawgrid=w=140:h=140:t=1:c=white@0.025,drawbox=x=0:y=0:w=1080:h=1920:color=black@0.08:t=fill",
-        "-t",
-        "40",
-        "-pix_fmt",
-        "yuv420p",
-        str(bg),
-    ])
-    return bg
 
 
 def _ffmpeg_escape(text: str) -> str:
