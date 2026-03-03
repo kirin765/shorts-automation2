@@ -1091,10 +1091,18 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
     def px_to_ass(v_px: int, *, min_v: int = 1) -> int:
         return max(min_v, int(round(v_px * (playres_y / 1920.0))))
 
-    # Subtitles: big, outlined, centered (avoid top/bottom bars)
+    # Subtitles: big, outlined, and placeable by style
     subs_fontsize_px = int(config.get("subtitle_font_size", 60))
     subs_outline_px = int(config.get("subtitle_outline", 8))
-    subs_margin_px = int(config.get("subtitle_margin_v", bottom_h + 120))
+    subtitle_align = (config.get("subtitle_align") or "bottom").strip().lower()
+    align_map = {"bottom": 2, "bottom_center": 2, "middle": 5, "center": 5, "center_center": 5, "top": 8}
+    subtitle_alignment = align_map.get(subtitle_align, 2)
+    subtitle_margin_v = int(config.get("subtitle_margin_v", 0))
+    if subtitle_alignment == 5:
+        subtitle_vshift = int(config.get("subtitle_vshift", 0))
+        # Convert vertical shift (px in output coordinates) into ASS space; negative values move up.
+        subtitle_margin_v = int(px_to_ass(subtitle_vshift + subtitle_margin_v, min_v=-300))
+
     subs_style = (
         f"FontName={subs_font_name},"
         f"FontSize={px_to_ass(subs_fontsize_px)},"
@@ -1104,8 +1112,8 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
         "BorderStyle=1,"
         f"Outline={px_to_ass(subs_outline_px)},"
         "Shadow=0,"
-        "Alignment=2,"
-        f"MarginV={px_to_ass(subs_margin_px, min_v=0)}"
+        f"Alignment={subtitle_alignment},"
+        f"MarginV={px_to_ass(subtitle_margin_v, min_v=-300)}"
     )
 
     # Title y position inside top bar
@@ -1160,17 +1168,28 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
             "1:a:0",
         ]
 
+    video_preset = str(config.get("video_preset", "medium")).strip() or "medium"
+    video_crf = int(config.get("video_crf", 21))
+    video_bitrate = str(config.get("video_bitrate", "")).strip()
+    audio_bitrate = str(config.get("audio_bitrate", "192k")).strip() or "192k"
+    bitrate_args = []
+    if video_bitrate:
+        bitrate_args = ["-b:v", video_bitrate]
+
     cmd += [
         "-c:v",
         "libx264",
         "-preset",
-        "medium",
+        video_preset,
         "-crf",
-        "21",
+        str(video_crf),
+        "-pix_fmt",
+        "yuv420p",
         "-c:a",
         "aac",
         "-b:a",
-        "192k",
+        audio_bitrate,
+        *bitrate_args,
         "-shortest",
         "-movflags",
         "+faststart",
