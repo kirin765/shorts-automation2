@@ -1,0 +1,55 @@
+{
+  "presets": [
+    {
+      "name": "center_for_mobile",
+      "label": "모바일 중간형(기본)",
+      "description": "중앙 자막 + 표준 크기",
+      "config": {
+        "subtitle_align": "center",
+        "subtitle_vshift": 0,
+        "subtitle_font_size": 58,
+        "subtitle_outline": 9,
+        "subtitle_max_chars": 26,
+        "subtitle_margin_v": 0,
+        "video_preset": "medium",
+        "video_crf": 20,
+        "video_bitrate": "4000k",
+        "audio_bitrate": "192k"
+      }
+    },
+    {
+      "name": "center_reader_mode",
+      "label": "가독성 우선",
+      "description": "조금 더 큰 글씨와 두꺼운 아웃라인",
+      "config": {
+        "subtitle_align": "center",
+        "subtitle_vshift": -110,
+        "subtitle_font_size": 66,
+        "subtitle_outline": 10,
+        "subtitle_max_chars": 24,
+        "subtitle_margin_v": 0,
+        "video_preset": "slow",
+        "video_crf": 18,
+        "video_bitrate": "4500k",
+        "audio_bitrate": "256k"
+      }
+    },
+    {
+      "name": "center_titlesafe",
+      "label": "타이틀 간섭 방지",
+      "description": "상단 제목과 충돌 줄이기 위해 약간 위로",
+      "config": {
+        "subtitle_align": "center",
+        "subtitle_vshift": -160,
+        "subtitle_font_size": 56,
+        "subtitle_outline": 9,
+        "subtitle_max_chars": 25,
+        "subtitle_margin_v": 0,
+        "video_preset": "slow",
+        "video_crf": 19,
+        "video_bitrate": "4200k",
+        "audio_bitrate": "256k"
+      }
+    }
+  ]
+}
