@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Iterable, Literal
 from urllib.parse import quote_plus
 
 from config_loader import ENV_SENTINEL, load_config
@@ -127,7 +127,6 @@ def split_for_captions_dense(text: str, *, max_chars: int = 22) -> list[str]:
                 " 그래서 ",
                 " 하지만 ",
                 " 그런데 ",
-                " 그러면 ",
                 " 즉 ",
                 " 다시 말해 ",
                 " 예를 들어 ",
@@ -135,6 +134,7 @@ def split_for_captions_dense(text: str, *, max_chars: int = 22) -> list[str]:
                 " 왜냐면 ",
                 " 반대로 ",
                 " 대신 ",
+                " 다시 ",
             ):
                 c = c.replace(conn, conn.rstrip() + "\n")
             parts = [p.strip() for p in c.split("\n") if p.strip()]
@@ -194,6 +194,22 @@ def _coerce_bool(value, *, default: bool = False) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return bool(value)
+
+
+def _cleanup_paths(paths: Iterable[Path], *, preserve: set[Path] | None = None) -> None:
+    preserved = preserve or set()
+    for path in set(paths):
+        if path in preserved:
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"[-] Failed to remove temporary artifact {path}: {_one_line(str(e))}")
+
+
+def _is_sample_output_dir(path: Path) -> bool:
+    lowered = str(path).replace("\\", "/").lower()
+    return "tmp_sample" in lowered and "run" in lowered
 
 
 def _normalize_subtitle_position(value) -> str:
@@ -271,6 +287,103 @@ def _read_srt_timing_lines(path: Path) -> list[tuple[int, float, float]]:
     if not out:
         raise ValueError("subtitle file has no timing lines")
     return out
+
+
+def _format_ass_timestamp(seconds: float) -> str:
+    total_cs = max(0, int(round(float(seconds) * 100.0)))
+    h = total_cs // 360000
+    m = (total_cs % 360000) // 6000
+    s = (total_cs % 6000) // 100
+    cs = total_cs % 100
+    return f"{h}:{m:02}:{s:02}.{cs:02}"
+
+
+def _escape_ass_text(text: str) -> str:
+    escaped = text.replace("\\", r"\\")
+    escaped = escaped.replace("{", r"\{").replace("}", r"\}")
+    escaped = escaped.replace("\r\n", "\n").replace("\r", "\n")
+    return escaped.replace("\n", r"\N")
+
+
+def _read_srt_cues_for_ass(path: Path) -> list[tuple[float, float, str]]:
+    raw = path.read_text(encoding="utf-8", errors="ignore")
+    if not raw.strip():
+        raise ValueError("subtitle file is empty")
+
+    blocks = re.split(r"\n\s*\n", raw.replace("\r\n", "\n").replace("\r", "\n").strip())
+    timing_pattern = re.compile(r"^(?P<start>\d\d:\d\d:\d\d,\d\d\d)\s*-->\s*(?P<end>\d\d:\d\d:\d\d,\d\d\d)\s*$")
+    cues: list[tuple[float, float, str]] = []
+
+    for block in blocks:
+        lines = [line.rstrip() for line in block.split("\n")]
+        if not lines:
+            continue
+
+        idx = 0
+        if re.fullmatch(r"\d+", lines[0].strip()):
+            idx = 1
+        if idx >= len(lines):
+            continue
+
+        match = timing_pattern.match(lines[idx].strip())
+        if not match:
+            raise ValueError(f"invalid timing line in subtitle block: {lines[idx]!r}")
+
+        start = _parse_srt_timestamp_to_seconds(match.group("start"))
+        end = _parse_srt_timestamp_to_seconds(match.group("end"))
+        text_lines = [line.strip() for line in lines[idx + 1 :] if line.strip()]
+        if not text_lines:
+            continue
+        cues.append((start, end, "\n".join(text_lines)))
+
+    if not cues:
+        raise ValueError("subtitle file has no usable cues")
+    return cues
+
+
+def _write_ass_from_srt(
+    srt_path: Path,
+    ass_path: Path,
+    *,
+    playres_y: int,
+    font_name: str,
+    font_size: int,
+    outline: int,
+    alignment: int,
+    margin_v: int,
+) -> None:
+    cues = _read_srt_cues_for_ass(srt_path)
+    ass_font_name = (font_name.split(",")[0].strip() if font_name else "") or "Noto Sans CJK KR"
+
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes",
+        "PlayResX: 1080",
+        f"PlayResY: {max(1, int(playres_y))}",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        (
+            "Style: Default,"
+            f"{ass_font_name},{int(font_size)},"
+            "&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,"
+            f"0,0,0,0,100,100,0,0,1,{int(outline)},0,{int(alignment)},20,20,{int(margin_v)},1"
+        ),
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+
+    for start, end, text in cues:
+        if end <= start:
+            end = start + 0.05
+        lines.append(
+            f"Dialogue: 0,{_format_ass_timestamp(start)},{_format_ass_timestamp(end)},Default,,0,0,0,,{_escape_ass_text(text)}"
+        )
+
+    ass_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _read_last_srt_end_time(path: Path) -> float:
@@ -584,51 +697,122 @@ def write_srt_aligned_openai(
     return
 
 
-def tts_edge(
+def tts_elevenlabs(
     text: str,
-    voice: str,
     out_mp3: Path,
     *,
-    rate: str = "+0%",
-    pitch: str = "+0Hz",
-    volume: str = "+0%",
-    out_srt: Path | None = None,
-    proxy: str | None = None,
-    timeout_s: int = 25,
+    voice_id: str,
+    api_key: str,
+    model_id: str = "eleven_multilingual_v2",
+    timeout_s: float = 40.0,
 ) -> None:
-    """Edge Neural TTS via the `edge_tts` CLI.
+    """ElevenLabs TTS for more natural speech.
 
-    Using a subprocess lets us enforce a hard timeout even if networking hangs.
+    This function only performs one request attempt and returns a focused error
+    when API/network behavior is not successful.
     """
-    import sys
+    if not text.strip():
+        raise RuntimeError("elevenlabs_tts empty text")
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "edge_tts",
-        "--text",
-        text,
-        "--voice",
-        voice,
-        "--rate",
-        rate,
-        "--volume",
-        volume,
-        "--pitch",
-        pitch,
-        "--write-media",
-        str(out_mp3),
-    ]
-    if out_srt:
-        cmd += ["--write-subtitles", str(out_srt)]
-    if proxy:
-        cmd += ["--proxy", proxy]
+    import requests
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
-    if result.returncode != 0:
-        raise RuntimeError(f"edge-tts failed (exit {result.returncode}): {result.stderr.strip()}")
-    if out_srt and (not out_srt.exists() or out_srt.stat().st_size == 0):
-        raise RuntimeError("edge-tts did not produce subtitles (SRT)")
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "xi-api-key": api_key,
+        "accept": "audio/mpeg",
+        "content-type": "application/json",
+    }
+    payload = {
+        "text": text,
+        "model_id": model_id,
+        "voice_settings": {
+            "stability": 0.45,
+            "similarity_boost": 0.80,
+            "style": 0.25,
+            "use_speaker_boost": True,
+        },
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=float(timeout_s))
+    except requests.Timeout as e:
+        raise RuntimeError(f"elevenlabs_tts timeout after {float(timeout_s):.1f}s: {e}") from e
+    except requests.RequestException as e:
+        raise RuntimeError(f"elevenlabs_tts network error: {e}") from e
+
+    status = int(r.status_code)
+    if status == 429 or status >= 500:
+        body = _one_line((r.text or "").strip())[:240]
+        raise RuntimeError(f"elevenlabs_tts transient failure: status={status}, body={body}")
+    if 400 <= status < 500:
+        body = _one_line((r.text or "").strip())[:240]
+        raise RuntimeError(f"elevenlabs_tts client failure: status={status}, body={body}")
+    if status not in (200, 201):
+        body = _one_line((r.text or "").strip())[:240]
+        raise RuntimeError(f"elevenlabs_tts unexpected status={status}: body={body}")
+
+    if not r.content:
+        raise RuntimeError("elevenlabs_tts returned empty audio payload")
+
+    ctype = (r.headers.get("content-type") or "").lower()
+    if "audio/mpeg" not in ctype and "audio/mp3" not in ctype:
+        raise RuntimeError(
+            f"elevenlabs_tts returned non-audio content-type: {r.headers.get('content-type')!r}"
+        )
+
+    out_mp3.write_bytes(r.content)
+
+
+def _is_retryable_tts_error(err: BaseException) -> bool:
+    msg = (str(err) or "").lower()
+    if "timeout" in msg:
+        return True
+    if "network error" in msg:
+        return True
+    if "transient" in msg:
+        return True
+    if "status=429" in msg:
+        return True
+    if "status=500" in msg:
+        return True
+    if "status=502" in msg:
+        return True
+    if "status=503" in msg:
+        return True
+    if "status=504" in msg:
+        return True
+    return False
+
+
+def tts_with_retries(
+    fn: Callable[[], None],
+    *,
+    label: str,
+    max_attempts: int,
+    initial_backoff_s: float,
+    max_backoff_s: float,
+    log_fn: Callable[[str], None] = print,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> None:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
+
+    delay = max(0.0, float(initial_backoff_s))
+    max_delay = max(0.0, float(max_backoff_s))
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            fn()
+            return
+        except Exception as e:
+            if (not _is_retryable_tts_error(e)) or attempt >= max_attempts:
+                raise
+
+            log_fn(f"[{label}] attempt {attempt}/{max_attempts} failed: {_one_line(str(e))}")
+            log_fn(f"[{label}] retrying in {delay:.1f}s")
+            if delay > 0:
+                sleep_fn(delay)
+            delay = min(max_delay, max(1.0, delay * 2.0)) if max_delay > 0 else 0.0
 
 
 def densify_srt_inplace(srt_path: Path, *, max_chars: int = 26) -> None:
@@ -680,53 +864,18 @@ def densify_srt_inplace(srt_path: Path, *, max_chars: int = 26) -> None:
     srt_path.write_text("\n".join(out_blocks).strip() + "\n", encoding="utf-8")
 
 
-def tts_elevenlabs(text: str, out_mp3: Path, *, voice_id: str, api_key: str, model_id: str = "eleven_multilingual_v2") -> None:
-    """ElevenLabs TTS for more natural speech."""
-    import requests
-
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    headers = {
-        "xi-api-key": api_key,
-        "accept": "audio/mpeg",
-        "content-type": "application/json",
-    }
-    payload = {
-        "text": text,
-        "model_id": model_id,
-        "voice_settings": {
-            "stability": 0.45,
-            "similarity_boost": 0.80,
-            "style": 0.25,
-            "use_speaker_boost": True,
-        },
-    }
-
-    r = requests.post(url, headers=headers, json=payload, timeout=40)
-    r.raise_for_status()
-    out_mp3.write_bytes(r.content)
-
-
-def tts_gtts(text: str, out_mp3: Path, lang: str = "ko") -> None:
-    from gtts import gTTS
-
-    gTTS(text=text, lang=lang).save(str(out_mp3))
-
-
 def _openai_api_key(config: dict) -> str:
     key = (config.get("openai_api_key") or os.environ.get("OPENAI_API_KEY") or "").strip()
     if not key:
         raise RuntimeError(
-            "대본 자동 생성(OpenAI)을 쓰려면 API 키가 필요합니다. "
-            "환경변수 `OPENAI_API_KEY`를 설정하세요. (또는 config의 `openai_api_key`)"
+            "?蹂??먮룞 ?앹꽦(OpenAI)???곕젮硫?API ?ㅺ? ?꾩슂?⑸땲?? "
+            "?섍꼍蹂??`OPENAI_API_KEY`瑜??ㅼ젙?섏꽭?? (?먮뒗 config??`openai_api_key`)"
         )
     return key
 
 
 def openai_generate_job(config: dict, job: Job) -> Job:
-    """Fill missing job fields using OpenAI Responses API.
-
-    This is best-effort and only populates fields that are missing/empty.
-    """
+    """Generate job fields (title/script/description/hashtags/pexels_query) via OpenAI Responses API."""
     import requests
 
     api_key = _openai_api_key(config)
@@ -741,13 +890,13 @@ def openai_generate_job(config: dict, job: Job) -> Job:
 
     topic = (job.topic or job.title or "").strip()
     if not topic:
-        raise RuntimeError("잡 파일에 `topic`(또는 최소 `title`)이 필요합니다. 예: {\"topic\": \"AI.com 도메인 가치\"}")
+        topic = "shorts topic"
 
     # Avoid hallucinated hard facts; keep it general unless user supplies facts in the topic.
     system = (
         "You write high-retention YouTube Shorts scripts (Korean). "
         "Do not invent precise statistics, dates, prices, quotes, or named sources. "
-        "If you need numbers, use vague ranges (e.g., '수십억', '몇 배') or omit them. "
+        "If you need numbers, use vague ranges (e.g., '?섏떗??, '紐?諛?) or omit them. "
         "Keep sentences short and punchy. Output must be valid JSON matching the provided schema."
     )
     user = (
@@ -766,7 +915,7 @@ def openai_generate_job(config: dict, job: Job) -> Job:
         "Structure:\n"
         "1) Hook\n"
         "2) 3-5 beats (each beat 1 sentence)\n"
-        "3) Wrap-up + subtle CTA (e.g., '더 알고 싶으면 저장')\n"
+        "3) Wrap-up + subtle CTA (e.g., '???뚭퀬 ?띠쑝硫????)\n"
     )
 
     schema = {
@@ -819,19 +968,23 @@ def openai_generate_job(config: dict, job: Job) -> Job:
         if text_out:
             break
     if not text_out:
-        raise RuntimeError("OpenAI 응답에서 텍스트를 찾지 못했습니다.")
+        raise RuntimeError("OpenAI ?묐떟?먯꽌 ?띿뒪?몃? 李얠? 紐삵뻽?듬땲??")
 
     obj = json.loads(text_out)
-
-    def _pick(existing: str | None, new: str) -> str:
-        return existing.strip() if existing and existing.strip() else new.strip()
+    title = (obj.get("title") or "").strip()
+    script = (obj.get("script") or "").strip()
+    description = (obj.get("description") or "").strip()
+    hashtags = (obj.get("hashtags") or "").strip()
+    pexels_query = (obj.get("pexels_query") or "").strip()
+    if not (title and script and description and hashtags and pexels_query):
+        raise RuntimeError("OpenAI returned incomplete job fields. expected title/script/description/hashtags/pexels_query")
 
     return Job(
-        title=_pick(job.title, obj["title"]),
-        script=_pick(job.script, obj["script"]),
-        description=_pick(job.description, obj["description"]),
-        hashtags=_pick(job.hashtags, obj["hashtags"]),
-        pexels_query=_pick(job.pexels_query, obj["pexels_query"]),
+        title=title,
+        script=script,
+        description=description,
+        hashtags=hashtags,
+        pexels_query=pexels_query,
         topic=job.topic,
         style=job.style,
         tone=job.tone,
@@ -1144,8 +1297,8 @@ def ensure_background_for_job(config: dict, job: Job, *, duration_s: float, out_
     api_key = (config.get("pexels_api_key") or os.environ.get("PEXELS_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError(
-            "background_provider=pexels 인데 Pexels API key가 없습니다. "
-            "환경변수 `PEXELS_API_KEY`를 설정하세요. (또는 config의 `pexels_api_key`)"
+            "background_provider=pexels ?몃뜲 Pexels API key媛 ?놁뒿?덈떎. "
+            "?섍꼍蹂??`PEXELS_API_KEY`瑜??ㅼ젙?섏꽭?? (?먮뒗 config??`pexels_api_key`)"
         )
 
     query = (config.get("pexels_query") or "").strip() or guess_pexels_query(job)
@@ -1338,8 +1491,6 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
     ffprobe = resolve_bin(config, "ffprobe_bin", "ffprobe")
 
     duration = probe_duration(audio, ffprobe=ffprobe)
-    srt_safe = srt.as_posix().replace("'", r"\'")
-
     top_h = int(config.get("top_bar_height", 260))
     bottom_h = int(config.get("bottom_bar_height", 260))
 
@@ -1419,6 +1570,8 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
         min_value=0,
     )
 
+    # Keep legacy default for legacy top/bottom-style setups.
+    # For center/middle, explicit subtitle_margin_v / subtitle_vshift are handled separately.
     subs_margin_default = _coerce_int(
         config.get("subtitle_margin_v"),
         default=bottom_h + 120,
@@ -1442,14 +1595,25 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
     elif vertical_sub_pos == "bottom":
         subs_margin_px = subs_margin_bottom
     else:
-        # Keep legacy center vertical shift behavior.
-        subtitle_vshift = _coerce_int(
-            config.get("subtitle_vshift"),
-            default=0,
-            key="subtitle_vshift",
-            min_value=-1920,
-        )
-        subs_margin_px = subs_margin_default + subtitle_vshift
+        # Center/middle: align to visual center unless explicitly overridden.
+        if "subtitle_margin_v" in config:
+            subs_margin_px = _coerce_int(
+                config.get("subtitle_margin_v"),
+                default=0,
+                key="subtitle_margin_v",
+                min_value=0,
+            )
+        elif "subtitle_vshift" in config:
+            # Backward-compatible override for legacy users that tuned by shift value.
+            subtitle_vshift = _coerce_int(
+                config.get("subtitle_vshift"),
+                default=0,
+                key="subtitle_vshift",
+                min_value=-1920,
+            )
+            subs_margin_px = subtitle_vshift
+        else:
+            subs_margin_px = 0
 
     print(
         f"[subtitles] position={subtitle_position} align={subtitle_alignment} "
@@ -1458,22 +1622,31 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
     )
 
     margin_min = -300 if vertical_sub_pos == "middle" else 0
-    subs_style = (
-        f"FontName={subs_font_name},"
-        f"FontSize={px_to_ass(subs_fontsize_px)},"
-        "PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00000000,"
-        "BackColour=&H00000000,"
-        "BorderStyle=1,"
-        f"Outline={px_to_ass(subs_outline_px)},"
-        "Shadow=0,"
-        f"Alignment={subtitle_alignment},"
-        f"MarginV={px_to_ass(subs_margin_px, min_v=margin_min)}"
+    ass_margin_v = px_to_ass(subs_margin_px, min_v=margin_min)
+    ass_path = out_video.with_suffix(".subs.ass")
+    try:
+        _write_ass_from_srt(
+            srt,
+            ass_path,
+            playres_y=playres_y,
+            font_name=subs_font_name,
+            font_size=px_to_ass(subs_fontsize_px),
+            outline=px_to_ass(subs_outline_px),
+            alignment=subtitle_alignment,
+            margin_v=ass_margin_v,
+        )
+    except Exception as e:
+        raise RuntimeError(f"subtitle ASS conversion failed: {_one_line(str(e))}") from e
+
+    print(
+        f"[subtitles] render_mode=ass align={subtitle_alignment} "
+        f"margin_v={ass_margin_v} ass={ass_path}"
     )
 
     # Title y position inside top bar
     # Keep some breathing room under the top bar for 1-2 lines.
     title_y = max(34, int(top_h * 0.16))
+    ass_safe = _ffmpeg_escape(str(ass_path))
 
     vf = (
         "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
@@ -1481,7 +1654,7 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
         f"drawbox=x=0:y=0:w=1080:h={top_h}:color=black@1.0:t=fill,"
         f"drawbox=x=0:y={1920 - bottom_h}:w=1080:h={bottom_h}:color=black@1.0:t=fill,"
         f"drawtext=textfile='{title_txt_safe}'{font_opt}:reload=0:x=(w-text_w)/2:y={title_y}:fontsize={title_fontsize}:fontcolor=white:borderw=8:bordercolor=black:line_spacing=10:text_align=C:fix_bounds=1,"
-        f"subtitles='{srt_safe}'{fontsdir_opt}:force_style='{subs_style}',"
+        f"ass='{ass_safe}'{fontsdir_opt},"
         f"drawbox=x=0:y=1892:w='1080*t/{duration:.3f}':h=10:color=0x00E5FF@0.9:t=fill"
     )
 
@@ -1720,7 +1893,7 @@ def load_job(path: Path) -> Job:
 
 
 def ensure_job_ready(config: dict, job: Job, *, allow_llm: bool) -> Job:
-    # If user only provides `topic`, fill everything via OpenAI.
+    # When OpenAI is enabled, refresh title/script/etc every run.
     needs = []
     if not (job.title or "").strip():
         needs.append("title")
@@ -1732,15 +1905,32 @@ def ensure_job_ready(config: dict, job: Job, *, allow_llm: bool) -> Job:
         needs.append("hashtags")
 
     if not needs:
-        return job
+        if not allow_llm:
+            return job
+        needs = ["title", "script", "description", "hashtags"]
 
     if not allow_llm:
-        raise RuntimeError(f"잡 파일에 {', '.join(needs)}가 없습니다. 자동 생성이 꺼져있습니다(--no-llm).")
+        raise RuntimeError(f"???뚯씪??{', '.join(needs)}媛 ?놁뒿?덈떎. ?먮룞 ?앹꽦??爰쇱졇?덉뒿?덈떎(--no-llm).")
 
-    print(f"[0/4] 대본/메타 자동 생성 (OpenAI): {', '.join(needs)}")
-    job2 = openai_generate_job(config, job)
+    print(f"[0/4] Regenerating title/script via OpenAI")
+    seed_topic = (job.topic or "").strip() or (job.title or "").strip() or (job.script or "").strip() or "shorts topic"
+    if len(seed_topic) > 80:
+        seed_topic = seed_topic[:80].strip()
+
+    seed_job = Job(
+        title=None,
+        script=None,
+        description=None,
+        hashtags=None,
+        pexels_query=job.pexels_query,
+        topic=seed_topic,
+        style=job.style,
+        tone=job.tone,
+        target_seconds=job.target_seconds,
+    )
+    job2 = openai_generate_job(config, seed_job)
     if not (job2.title and job2.script):
-        raise RuntimeError("OpenAI 생성 결과가 비어있습니다(title/script).")
+        raise RuntimeError("OpenAI ?앹꽦 寃곌낵媛 鍮꾩뼱?덉뒿?덈떎(title/script).")
     return job2
 
 
@@ -1996,6 +2186,10 @@ def main() -> int:
     idempotency_hit: bool = False
     idempotency_key: str | None = None
     idempotency_state_file: str | None = None
+    generated_artifacts: list[Path] = []
+    preserved_artifacts: set[Path] = set()
+    keep_intermediate_artifacts: bool = False
+    out_dir: Path | None = None
 
     try:
         config = load_config(args.config)
@@ -2003,66 +2197,85 @@ def main() -> int:
 
         out_dir = Path(config.get("output_dir", "output"))
         out_dir.mkdir(parents=True, exist_ok=True)
+        if _is_sample_output_dir(out_dir):
+            print(f"[i] output_dir looks like a sample path ({out_dir}). run_short does not rename output folders itself.")
+
+        keep_intermediate_artifacts = _coerce_bool(
+            config.get("keep_intermediate_artifacts"), default=False
+        )
 
         external_audio = bool(args.audio)
         audio = Path(args.audio) if external_audio else (out_dir / f"{stamp}.mp3")
         srt = out_dir / f"{stamp}.srt"
         video = out_dir / f"{stamp}.mp4"
         bg_out = out_dir / f"{stamp}.bg.mp4"
+        preserved_artifacts.add(video)
+        generated_artifacts.append(srt)
+        if external_audio:
+            preserved_artifacts.add(audio)
+        else:
+            generated_artifacts.append(audio)
 
         if external_audio:
             if not audio.exists():
                 raise FileNotFoundError(f"--audio not found: {audio}")
-            print("[1/3] TTS 스킵 (--audio)")
+            print("[1/3] TTS ?ㅽ궢 (--audio)")
         else:
-            print("[1/4] TTS 생성")
-            tts_provider = (config.get("tts_provider") or "edge").lower()
+            print("[1/4] TTS ?앹꽦")
+            tts_provider = (config.get("tts_provider") or "elevenlabs").lower()
+            if tts_provider != "elevenlabs":
+                print(f"[-] tts_provider={tts_provider!r} is not supported. Forcing ElevenLabs-only mode.")
 
-            if tts_provider == "elevenlabs":
-                try:
-                    api_key = config.get("elevenlabs_api_key") or os.environ.get("ELEVENLABS_API_KEY")
-                    voice_id = config.get("elevenlabs_voice_id") or os.environ.get("ELEVENLABS_VOICE_ID")
-                    if not api_key or not voice_id:
-                        raise RuntimeError("ElevenLabs 설정 필요: elevenlabs_api_key / elevenlabs_voice_id (또는 환경변수)")
-                    tts_elevenlabs(job.script or "", audio, voice_id=voice_id, api_key=api_key)
-                except Exception as e:
-                    print(f"ElevenLabs TTS 실패, Edge TTS로 재시도: {e}")
-                    tts_provider = "edge"
+            api_key = config.get("elevenlabs_api_key") or os.environ.get("ELEVENLABS_API_KEY")
+            voice_id = config.get("elevenlabs_voice_id") or os.environ.get("ELEVENLABS_VOICE_ID")
+            model_id = config.get("elevenlabs_model_id") or os.environ.get("ELEVENLABS_MODEL_ID") or "eleven_multilingual_v2"
+            if not api_key or not voice_id:
+                raise RuntimeError(
+                    "Missing ElevenLabs config: set elevenlabs_api_key / elevenlabs_voice_id (or ELEVENLABS_API_KEY / ELEVENLABS_VOICE_ID)."
+                )
 
-            if tts_provider == "edge":
-                try:
-                    proxy = (config.get("edge_proxy") or os.environ.get("EDGE_TTS_PROXY") or "").strip() or None
-                    timeout_s = int(config.get("edge_timeout_s", 25))
-                    edge_subs = bool(config.get("subtitle_align_edge", True))
-                    edge_volume = str(config.get("edge_volume", "+0%"))
-                    tts_edge(
+            tts_attempts = _coerce_int(
+                config.get("elevenlabs_tts_attempts"),
+                default=3,
+                key="elevenlabs_tts_attempts",
+                min_value=1,
+            )
+            tts_initial_backoff_s = _coerce_float(
+                config.get("elevenlabs_tts_initial_backoff_s"),
+                default=1.0,
+                key="elevenlabs_tts_initial_backoff_s",
+            )
+            tts_max_backoff_s = _coerce_float(
+                config.get("elevenlabs_tts_max_backoff_s"),
+                default=6.0,
+                key="elevenlabs_tts_max_backoff_s",
+            )
+            if tts_max_backoff_s < tts_initial_backoff_s:
+                print(
+                    "[-] elevenlabs_tts_max_backoff_s is less than elevenlabs_tts_initial_backoff_s; using initial value."
+                )
+                tts_max_backoff_s = tts_initial_backoff_s
+
+            tts_timeout_s = _coerce_float(config.get("elevenlabs_tts_timeout_s"), default=40.0, key="elevenlabs_tts_timeout_s")
+            try:
+                tts_with_retries(
+                    lambda: tts_elevenlabs(
                         job.script or "",
-                        config.get("voice", "ko-KR-SunHiNeural"),
                         audio,
-                        rate=config.get("edge_rate", "+0%"),
-                        volume=edge_volume,
-                        pitch=config.get("edge_pitch", "+0Hz"),
-                        out_srt=(srt if edge_subs else None),
-                        proxy=proxy,
-                        timeout_s=timeout_s,
-                    )
-                    if edge_subs:
-                        densify_srt_inplace(srt, max_chars=int(config.get("subtitle_max_chars", 26)))
-                except Exception as e:
-                    print(f"Edge TTS 실패, gTTS로 재시도: {e}")
-                    try:
-                        tts_gtts(job.script or "", audio, lang=config.get("default_language", "ko"))
-                    except Exception as e2:
-                        raise RuntimeError(
-                            "TTS 생성에 실패했습니다. Edge TTS와 gTTS 모두 인터넷 연결(DNS/방화벽/프록시)에 의존합니다.\n"
-                            "- 네트워크/DNS가 되는지 확인하거나\n"
-                            "- 프록시 환경이면 config의 `edge_proxy` 또는 환경변수 `EDGE_TTS_PROXY`를 설정하거나\n"
-                            "- 임시로 `--audio`로 기존 음성 파일을 넣어 렌더만 실행하세요.\n"
-                            f"Edge TTS 오류: {e}\n"
-                            f"gTTS 오류: {e2}"
-                        ) from e2
+                        voice_id=voice_id,
+                        api_key=api_key,
+                        model_id=model_id,
+                        timeout_s=tts_timeout_s,
+                    ),
+                    label="tts",
+                    max_attempts=tts_attempts,
+                    initial_backoff_s=tts_initial_backoff_s,
+                    max_backoff_s=tts_max_backoff_s,
+                )
+            except Exception as e:
+                raise RuntimeError(f"TTS failed after {tts_attempts} attempts: {_one_line(str(e))}") from e
 
-        print("[2/3] 자막 생성" if external_audio else "[2/4] 자막 생성")
+        print("[2/3] ?먮쭑 ?앹꽦" if external_audio else "[2/4] ?먮쭑 ?앹꽦")
         duration = probe_duration(audio, ffprobe=resolve_bin(config, "ffprobe_bin", "ffprobe"))
         subtitle_sync_tolerance = _coerce_float(
             config.get("subtitle_sync_drift_tolerance"),
@@ -2093,7 +2306,7 @@ def main() -> int:
         # 1) OpenAI alignment (best sync)
         if (not external_audio) and bool(config.get("subtitle_align_openai", True)):
             try:
-                print("[2-1/4] OpenAI 자막 정렬 시도")
+                print("[2-1/4] OpenAI ?먮쭑 ?뺣젹 ?쒕룄")
                 write_srt_aligned_openai(
                     config,
                     audio_path=audio,
@@ -2114,35 +2327,16 @@ def main() -> int:
                     subtitle_method = "openai"
                 else:
                     print(
-                        f"[-] OpenAI 자막이 오디오 길이와 동기화되지 않았습니다. "
-                        f"(허용 오차 {subtitle_sync_tolerance:.2f}s). fallback 진행"
+                        f"[-] OpenAI ?먮쭑???ㅻ뵒??湲몄씠? ?숆린?붾릺吏 ?딆븯?듬땲?? "
+                        f"(?덉슜 ?ㅼ감 {subtitle_sync_tolerance:.2f}s). fallback 吏꾪뻾"
                     )
             except Exception as e:
-                print(f"[-] OpenAI 자막 정렬 실패: {e}")
+                print(f"[-] OpenAI ?먮쭑 ?뺣젹 ?ㅽ뙣: {e}")
 
-        # 2) If OpenAI path is disabled/실패, accept Edge timing only if valid.
-        if (not subtitle_ok) and (not external_audio) and bool(config.get("subtitle_align_edge", True)):
-            if srt.exists() and srt.stat().st_size > 0:
-                if _apply_srt_timing_guard(
-                    srt,
-                    duration,
-                    enabled=subtitle_sync_repair,
-                    repair_max_drift=subtitle_sync_repair_max_drift,
-                    max_scale_delta=subtitle_sync_max_scale_delta,
-                    validate_max_drift=subtitle_sync_tolerance,
-                    label="edge",
-                ):
-                    subtitle_ok = True
-                    subtitle_method = "edge"
-                else:
-                    print("[-] Edge 자막도 동기화 검증에 실패해 fallback 분기로 이동")
-            else:
-                print("[-] Edge 자막 파일이 비어 있어 fallback 분기로 이동")
-
-        # 3) Final fallback: text split aligned only by script duration.
+        # 2) Final fallback: script split aligned only by script duration.
         if not subtitle_ok:
             try:
-                print("[2-2/4] 스크립트 기반 자막 분할 fallback")
+                print("[2-2/4] ?ㅽ겕由쏀듃 湲곕컲 ?먮쭑 遺꾪븷 fallback")
                 max_chars = _coerce_int(config.get("subtitle_max_chars"), default=26, key="subtitle_max_chars", min_value=4)
                 lines = split_for_captions_dense(job.script or "", max_chars=max_chars) or split_for_captions(job.script or "")
                 write_srt(lines, duration, srt)
@@ -2164,18 +2358,23 @@ def main() -> int:
 
         print(f"[i] Subtitles ready: source={subtitle_method}, sync_tolerance={subtitle_sync_tolerance:.2f}s")
 
-        print("[3/3] 영상 렌더링" if external_audio else "[3/4] 영상 렌더링")
+        print("[3/3] Render video" if external_audio else "[3/4] Render video")
         bg, credit_line = ensure_background_for_job(config, job, duration_s=duration, out_path=bg_out)
+        if bg == bg_out:
+            generated_artifacts.append(bg)
         render_video(bg, audio, srt, video, config, job.title or "")
+        generated_artifacts.append(video.with_suffix(".title.txt"))
+        generated_artifacts.append(video.with_suffix(".subs.ass"))
 
-        print(f"렌더 완료: {video}")
+        print(f"?뚮뜑 ?꾨즺: {video}")
         if credit_line:
             credit_path = out_dir / f"{stamp}.credits.txt"
             credit_path.write_text(credit_line + "\n", encoding="utf-8")
-            print(f"크레딧: {credit_path}")
+            print(f"?щ젅?? {credit_path}")
+            generated_artifacts.append(credit_path)
 
         if no_upload:
-            print("업로드 스킵 (--no-upload 또는 NO_UPLOAD=1)")
+            print("?낅줈???ㅽ궢 (--no-upload ?먮뒗 NO_UPLOAD=1)")
         else:
             yt_cfg = dict(config.get("youtube") or {})
             idempotency_key = _job_idempotency_key(job_path)
@@ -2192,13 +2391,13 @@ def main() -> int:
                 upload_url = existing.get("upload_url") if isinstance(existing.get("upload_url"), str) else None
                 if not upload_url and video_id:
                     upload_url = f"https://youtu.be/{video_id}"
-                print(f"[4/4] 유튜브 업로드 스킵 (이미 업로드됨): {upload_url or (video_id or 'unknown')}")
+                print(f"[4/4] ?좏뒠釉??낅줈???ㅽ궢 (?대? ?낅줈?쒕맖): {upload_url or (video_id or 'unknown')}")
             else:
-                print("[4/4] 유튜브 업로드")
+                print("[4/4] Uploading to YouTube...")
                 validate_upload_checklist(config, job, video)
                 video_id = upload_video(config, job, video, credit_line=credit_line)
                 upload_url = f"https://youtu.be/{video_id}"
-                print(f"업로드 완료: {upload_url}")
+                print(f"?낅줈???꾨즺: {upload_url}")
 
                 # Persist as soon as we have a video id so reruns won't duplicate-upload.
                 if bool(yt_cfg.get("idempotency_enabled", True)):
@@ -2282,7 +2481,18 @@ def main() -> int:
         if args.traceback:
             raise
         return 1
+    finally:
+        if not keep_intermediate_artifacts:
+            _cleanup_paths(generated_artifacts, preserve=preserved_artifacts)
+            if out_dir is not None:
+                for artifact in list(out_dir.glob(f"{stamp}.*")):
+                    if artifact not in preserved_artifacts and artifact.is_file():
+                        try:
+                            artifact.unlink(missing_ok=True)
+                        except Exception as e:
+                            print(f"[-] Failed to remove temporary artifact {artifact}: {_one_line(str(e))}")
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

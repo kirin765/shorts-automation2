@@ -69,10 +69,10 @@ def load_config(config_arg: str | None) -> dict:
 
     - If config_arg is ENV (case-insensitive) or missing/non-existent, we do not require any config file.
     - Env overrides support:
-      - Top-level keys: e.g. TTS_PROVIDER=edge, VOICE=...
+      - Top-level keys: e.g. TTS_PROVIDER=elevenlabs, VOICE=...
       - Nested keys: e.g. YOUTUBE__PRIVACY_STATUS=private
       - Prefixed nested keys: SA__YOUTUBE__PRIVACY_STATUS=private
-      - Convenience secrets: OPENAI_API_KEY, PEXELS_API_KEY, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID
+      - Convenience secrets: OPENAI_API_KEY, PEXELS_API_KEY, ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID, ELEVENLABS_MODEL_ID
     """
     cfg: dict
     if config_arg and config_arg.strip() and config_arg.strip().upper() != ENV_SENTINEL:
@@ -93,6 +93,8 @@ def load_config(config_arg: str | None) -> dict:
         cfg["elevenlabs_api_key"] = os.environ["ELEVENLABS_API_KEY"].strip()
     if os.environ.get("ELEVENLABS_VOICE_ID"):
         cfg["elevenlabs_voice_id"] = os.environ["ELEVENLABS_VOICE_ID"].strip()
+    if os.environ.get("ELEVENLABS_MODEL_ID"):
+        cfg["elevenlabs_model_id"] = os.environ["ELEVENLABS_MODEL_ID"].strip()
 
     # Override top-level scalar keys directly via env var matching (KEY -> key).
     for k, v in list(cfg.items()):
