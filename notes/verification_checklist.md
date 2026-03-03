@@ -43,10 +43,15 @@ ffprobe -hide_banner -v error \
 - 자막이 너무 작거나 너무 아래로 내려가서 UI에 가리지 않는지
 - 줄바꿈이 과하게 깨지지 않는지 (한 줄이 너무 길거나, 1~2글자만 남는 줄이 반복되지 않는지)
 - 제목 상단 바와 자막 하단 바가 서로 겹치지 않는지
+- `subtitle_position` 파싱 결과(예: `center,middle`)와 실제 `Alignment`(예: `center,middle`일 때 `align=5`)가 로그에 남는지 확인
+- SRT 마지막 종료 타임스탬프와 오디오 길이 drift가 `subtitle_sync_drift_tolerance` 이내인지 확인
+- 보정 로그(`label=openai|edge|script_split`)에서 `initial_drift`, `applied_shift`, `applied_scale`, `final_drift` 확인
+- `subtitle_sync_repair` 실패 시 `subtitle_method`가 다음 경로로 넘어가는지 확인 (`openai` -> `edge` -> `script_split`)
 
 WSL에서 한글 폰트가 안 잡히면 자막이 안 보일 수 있다.
 - 기본 동작: `font_file`의 폴더를 `subtitles`에 `fontsdir`로 지정
 - 필요하면 `config.json`에 `subtitle_fontsdir` 지정
+- 필요 시 `subtitle_position`, `subtitle_margin_top_v`, `subtitle_margin_bottom_v`, `subtitle_sync_repair`, `subtitle_sync_repair_max_drift`, `subtitle_sync_max_scale_delta`, `subtitle_sync_drift_tolerance`로 미세 조정
 
 ## 5) 메타데이터(업로드/게시)
 
@@ -65,4 +70,3 @@ WSL에서 한글 폰트가 안 잡히면 자막이 안 보일 수 있다.
 
 이 프로젝트는 업로드 직전에 자동 체크를 수행한다(제목/해시태그/세로비율/오디오/길이 등).
 체크를 강화/조정하려면 `config.json`의 `youtube.*` 제한값을 확인/수정한다.
-

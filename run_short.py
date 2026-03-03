@@ -49,6 +49,22 @@ def resolve_bin(config: dict, key: str, default: str) -> str:
     found = shutil.which(default)
     if found:
         return found
+    if default == "ffmpeg":
+        for alt in (
+            "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
+            "/usr/local/opt/ffmpeg-full/bin/ffmpeg",
+            shutil.which("ffmpeg-full"),
+        ):
+            if alt and Path(alt).exists():
+                return str(alt)
+    elif default == "ffprobe":
+        for alt in (
+            "/opt/homebrew/opt/ffmpeg-full/bin/ffprobe",
+            "/usr/local/opt/ffmpeg-full/bin/ffprobe",
+            shutil.which("ffprobe-full"),
+        ):
+            if alt and Path(alt).exists():
+                return str(alt)
     raise RuntimeError(
         f"Required binary not found: {default}. "
         f"Install it or set `{key}` via env/config to an absolute path."
@@ -141,6 +157,251 @@ def fmt_time(seconds: float) -> str:
     s = int(seconds % 60)
     ms = int((seconds - int(seconds)) * 1000)
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+
+def _coerce_int(value, *, default: int, key: str | None = None, min_value: int = 0) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        if key is not None:
+            print(f"[-] Invalid numeric config '{key}'={value!r}; using default {default}.")
+        return default
+
+    if n < min_value:
+        if key is not None:
+            print(f"[-] Config '{key}'={n} is below minimum ({min_value}); using default {default}.")
+        return default
+
+    return n
+
+
+def _coerce_float(value, *, default: float, key: str | None = None) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        if key is not None:
+            print(f"[-] Invalid numeric config '{key}'={value!r}; using default {default}.")
+        return default
+
+
+def _coerce_bool(value, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _normalize_subtitle_position(value) -> str:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        print("[-] subtitle_position is empty. Falling back to center,middle.")
+        return "center,middle"
+
+    parts = [p.strip() for p in normalized.split(",")]
+    if len(parts) != 2:
+        print(f"[-] Invalid subtitle_position '{normalized}'. Falling back to center,middle.")
+        return "center,middle"
+
+    horizontal, vertical = parts
+    if horizontal not in {"left", "center", "right"}:
+        print(f"[-] Invalid subtitle horizontal position '{horizontal}'. Falling back to center,middle.")
+        return "center,middle"
+
+    if vertical not in {"top", "middle", "bottom"}:
+        print(f"[-] Invalid subtitle vertical position '{vertical}'. Falling back to center,middle.")
+        return "center,middle"
+
+    return f"{horizontal},{vertical}"
+
+
+def _align_from_position(position: str) -> int:
+    horizontal, vertical = _normalize_subtitle_position(position).split(",")
+
+    return {
+        "top": {"left": 7, "center": 8, "right": 9},
+        "middle": {"left": 4, "center": 5, "right": 6},
+        "bottom": {"left": 1, "center": 2, "right": 3},
+    }[vertical][horizontal]
+
+
+def _font_name_from_path(fontfile: str) -> str:
+    stem = Path(fontfile).stem
+    name = stem.replace("_", " ").replace("-", " ")
+    name = re.sub(r"(?<=[a-zA-Z])(?=[A-Z])", " ", name)
+    return " ".join(name.split())
+
+
+def _coerce_font_name(family: str | None, fontfile: str | None = None) -> str:
+    if family:
+        return ",".join(part.strip() for part in family.split(",") if part.strip()) or "Noto Sans CJK KR"
+    if fontfile:
+        return _font_name_from_path(fontfile)
+    return "Noto Sans CJK KR"
+
+
+def _parse_srt_timestamp_to_seconds(value: str) -> float:
+    h, m, rest = value.split(":")
+    s, ms = rest.split(",")
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
+
+
+def _read_srt_timing_lines(path: Path) -> list[tuple[int, float, float]]:
+    raw = path.read_text(encoding="utf-8", errors="ignore")
+    if not raw.strip():
+        raise ValueError("subtitle file is empty")
+
+    lines = raw.splitlines()
+    timing_pattern = re.compile(r"^(?P<start>\d\d:\d\d:\d\d,\d\d\d)\s*-->\s*(?P<end>\d\d:\d\d:\d\d,\d\d\d)\s*$")
+    out: list[tuple[int, float, float]] = []
+    for i, line in enumerate(lines):
+        if "-->" not in line:
+            continue
+        match = timing_pattern.match(line.strip())
+        if not match:
+            raise ValueError(f"invalid timing format at line {i + 1}: {line!r}")
+        start = _parse_srt_timestamp_to_seconds(match.group("start"))
+        end = _parse_srt_timestamp_to_seconds(match.group("end"))
+        out.append((i, start, end))
+
+    if not out:
+        raise ValueError("subtitle file has no timing lines")
+    return out
+
+
+def _read_last_srt_end_time(path: Path) -> float:
+    return _read_srt_timing_lines(path)[-1][2]
+
+
+def _repair_srt_timing(
+    path: Path,
+    audio_duration: float,
+    *,
+    enabled: bool = True,
+    max_drift: float = 0.5,
+    max_scale_delta: float = 0.12,
+    label: str = "srt",
+) -> bool:
+    if not enabled:
+        print(f"[subtitles] repair disabled for {label}; using raw timing.")
+        return _validate_srt_timing(path, audio_duration, max_drift=max_drift)
+
+    try:
+        entries = _read_srt_timing_lines(path)
+        raw = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception as e:
+        print(f"[-] subtitle repair parse failed ({label}): {e}")
+        return False
+
+    if not entries:
+        print(f"[-] subtitle repair failed ({label}): no timing entries found")
+        return False
+
+    starts = [start for _, start, _ in entries]
+    ends = [end for _, _, end in entries]
+    first_start = starts[0]
+    last_end = ends[-1]
+    initial_drift = abs(last_end - audio_duration)
+    applied_shift = 0.0
+    applied_scale = 1.0
+    should_apply = False
+
+    if first_start > 0 and first_start <= max_drift:
+        # remove leading silence by shifting all cue timings backward
+        shift = -first_start
+        entries = [
+            (i, max(0.0, start + shift), max(0.0, end + shift))
+            for (i, start, end) in entries
+        ]
+        first_start = 0.0
+        last_end = entries[-1][2]
+        applied_shift = shift
+        should_apply = True
+
+    drift_after_shift = abs(last_end - audio_duration)
+    if drift_after_shift > max_drift and audio_duration > 0 and entries:
+        target_scale = audio_duration / last_end
+        target_scale = max(1.0 - max_scale_delta, min(1.0 + max_scale_delta, target_scale))
+        if abs(target_scale - 1.0) > 1e-9:
+            entries = [
+                (i, start * target_scale, end * target_scale)
+                for (i, start, end) in entries
+            ]
+            last_end = entries[-1][2]
+            applied_scale = target_scale
+            should_apply = True
+
+    if not should_apply:
+        print(
+            f"[subtitles] {label} timing repair skipped: first_start={first_start:.3f}s, "
+            f"initial_drift={initial_drift:.2f}s"
+        )
+        return True
+
+    fixed_lines = raw[:]
+    for idx, start, end in entries:
+        fixed_lines[idx] = f"{fmt_time(start)} --> {fmt_time(end)}"
+
+    try:
+        path.write_text("\n".join(fixed_lines), encoding="utf-8")
+    except Exception as e:
+        print(f"[-] Failed to write repaired subtitles ({label}): {e}")
+        return False
+
+    final_drift = abs(last_end - audio_duration)
+    print(
+        f"[subtitles] repair label={label} applied_shift={applied_shift:.3f}s "
+        f"applied_scale={applied_scale:.6f} initial_drift={initial_drift:.2f}s final_drift={final_drift:.2f}s "
+        f"file={path}"
+    )
+    return True
+
+
+def _validate_srt_timing(path: Path, audio_duration: float, *, max_drift: float = 0.5) -> bool:
+    try:
+        last_end = _read_last_srt_end_time(path)
+    except Exception as e:
+        print(f"[-] Invalid subtitle timing ({e}); file={path}")
+        return False
+
+    if last_end <= 0:
+        print(f"[-] Subtitle timing invalid: last_end={last_end:.2f} (file={path})")
+        return False
+
+    drift = abs(last_end - audio_duration)
+    if drift > max_drift:
+        print(f"[-] Subtitle timing drift={drift:.2f}s exceeded threshold ({max_drift}s). file={path}, audio={audio_duration:.2f}, last_end={last_end:.2f}")
+        return False
+
+    return True
+
+
+def _apply_srt_timing_guard(
+    path: Path,
+    audio_duration: float,
+    *,
+    enabled: bool,
+    repair_max_drift: float,
+    max_scale_delta: float,
+    validate_max_drift: float,
+    label: str,
+) -> bool:
+    if enabled:
+        if not _repair_srt_timing(
+            path,
+            audio_duration,
+            max_drift=repair_max_drift,
+            max_scale_delta=max_scale_delta,
+            label=label,
+        ):
+            print(f"[-] {label} subtitle repair failed; moving to fallback.")
+            return False
+
+    return _validate_srt_timing(path, audio_duration, max_drift=validate_max_drift)
 
 
 def write_srt(lines: list[str], duration: float, srt_path: Path) -> None:
@@ -941,14 +1202,43 @@ def resolve_font_for_korean(config: dict) -> tuple[str | None, str | None]:
     `drawtext` shows tofu squares when a glyph isn't available in the chosen font.
     In WSL, Korean fonts are often available only on the Windows side.
     """
+    def _fc_match_font(query: str) -> tuple[str | None, str | None]:
+        # Ask fontconfig for an installed fallback that supports the language.
+        try:
+            result = subprocess.run(
+                ["fc-match", "-f", "%{file}\\n%{family}\\n", query],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2,
+            )
+            if result.returncode != 0:
+                return None, None
+            lines = (result.stdout or "").splitlines()
+            if not lines:
+                return None, None
+            fontfile = lines[0].strip()
+            fontname = lines[1].strip() if len(lines) > 1 else None
+            if fontfile and Path(fontfile).exists():
+                return fontfile, fontname
+        except Exception:
+            pass
+        return None, None
+
     raw = (config.get("font_file") or "").strip()
     if raw:
         p = Path(raw)
         if p.exists():
-            return str(p), None
+            fontfile = str(p)
+            print(f"[font] resolved title/subtitle font from config: path={fontfile}")
+            return fontfile, _coerce_font_name(None, fontfile)
 
     # WSL: use Windows font files if present.
     candidates: list[tuple[str, str]] = [
+        ("/System/Library/Fonts/AppleSDGothicNeo.ttc", "Apple SD Gothic Neo"),
+        ("/System/Library/Fonts/Supplemental/AppleGothic.ttf", "Apple Gothic"),
+        ("/System/Library/Fonts/NotoSansCJK.ttc", "Noto Sans CJK KR"),
+        ("/System/Library/Fonts/Supplemental/NanumGothic.ttc", "Nanum Gothic"),
         ("/mnt/c/Windows/Fonts/malgunbd.ttf", "Malgun Gothic"),
         ("/mnt/c/Windows/Fonts/malgun.ttf", "Malgun Gothic"),
         ("/mnt/c/Windows/Fonts/NanumGothicBold.ttf", "NanumGothic"),
@@ -956,23 +1246,24 @@ def resolve_font_for_korean(config: dict) -> tuple[str | None, str | None]:
     ]
     for path, name in candidates:
         if Path(path).exists():
+            print(f"[font] resolved title/subtitle font from fallback path: path={path}")
             return path, name
 
     # Last resort: fontconfig (Linux). Might still resolve to a non-Korean font if CJK isn't installed.
-    try:
-        result = subprocess.run(
-            ["fc-match", "-f", "%{file}\n", "Noto Sans CJK KR:style=Bold"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=2,
-        )
-        fontfile = (result.stdout or "").strip()
-        if fontfile and Path(fontfile).exists():
-            return fontfile, "Noto Sans CJK KR"
-    except Exception:
-        pass
+    for query in (
+        "Noto Sans CJK KR:style=Bold",
+        "Noto Sans CJK KR",
+        "Noto Sans KR:style=Bold",
+        "Apple SD Gothic Neo:style=Bold",
+        ":lang=ko",
+    ):
+        fontfile, fontname = _fc_match_font(query)
+        if fontfile:
+            family = _coerce_font_name(fontname, fontfile)
+            print(f"[font] resolved title/subtitle font via fc-match query={query!r}: path={fontfile}, family={family}")
+            return fontfile, family
 
+    print("[font] no Korean-capable font detected. Falling back to ffmpeg/fontconfig default.")
     return None, None
 
 
@@ -1061,6 +1352,10 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
         if fontname:
             subs_font_name = fontname
 
+    subtitle_fontfile = fontfile or ""
+    subtitle_font_name = _coerce_font_name(subs_font_name, subtitle_fontfile)
+    subs_font_name = subtitle_font_name
+
     # libass (used by ffmpeg subtitles filter) needs the font to be discoverable via fontconfig or fontsdir.
     # In WSL, Korean fonts commonly live in Windows fonts directory which fontconfig may not scan by default.
     # Use a deterministic fontsdir that contains the selected fontfile when possible.
@@ -1091,18 +1386,78 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
     def px_to_ass(v_px: int, *, min_v: int = 1) -> int:
         return max(min_v, int(round(v_px * (playres_y / 1920.0))))
 
-    # Subtitles: big, outlined, and placeable by style
-    subs_fontsize_px = int(config.get("subtitle_font_size", 60))
-    subs_outline_px = int(config.get("subtitle_outline", 8))
-    subtitle_align = (config.get("subtitle_align") or "bottom").strip().lower()
-    align_map = {"bottom": 2, "bottom_center": 2, "middle": 5, "center": 5, "center_center": 5, "top": 8}
-    subtitle_alignment = align_map.get(subtitle_align, 2)
-    subtitle_margin_v = int(config.get("subtitle_margin_v", 0))
-    if subtitle_alignment == 5:
-        subtitle_vshift = int(config.get("subtitle_vshift", 0))
-        # Convert vertical shift (px in output coordinates) into ASS space; negative values move up.
-        subtitle_margin_v = int(px_to_ass(subtitle_vshift + subtitle_margin_v, min_v=-300))
+    # Subtitles: configurable position and styling for readability on mobile.
+    subtitle_position_raw = config.get("subtitle_position")
+    if isinstance(subtitle_position_raw, str) and subtitle_position_raw.strip():
+        subtitle_position = _normalize_subtitle_position(subtitle_position_raw)
+    else:
+        # Backward compatibility for existing configs that still use subtitle_align.
+        subtitle_align = (config.get("subtitle_align") or "").strip().lower()
+        align_to_position = {
+            "bottom": "center,bottom",
+            "bottom_center": "center,bottom",
+            "middle": "center,middle",
+            "center": "center,middle",
+            "center_center": "center,middle",
+            "top": "center,top",
+        }
+        subtitle_position = align_to_position.get(subtitle_align, "center,middle")
 
+    _, vertical_sub_pos = subtitle_position.split(",")
+    subtitle_alignment = _align_from_position(subtitle_position)
+
+    subs_fontsize_px = _coerce_int(
+        config.get("subtitle_font_size"),
+        default=88,
+        key="subtitle_font_size",
+        min_value=30,
+    )
+    subs_outline_px = _coerce_int(
+        config.get("subtitle_outline"),
+        default=8,
+        key="subtitle_outline",
+        min_value=0,
+    )
+
+    subs_margin_default = _coerce_int(
+        config.get("subtitle_margin_v"),
+        default=bottom_h + 120,
+        key="subtitle_margin_v",
+        min_value=0,
+    )
+    subs_margin_top = _coerce_int(
+        config.get("subtitle_margin_top_v"),
+        default=subs_margin_default,
+        key="subtitle_margin_top_v",
+        min_value=0,
+    )
+    subs_margin_bottom = _coerce_int(
+        config.get("subtitle_margin_bottom_v"),
+        default=subs_margin_default,
+        key="subtitle_margin_bottom_v",
+        min_value=0,
+    )
+    if vertical_sub_pos == "top":
+        subs_margin_px = subs_margin_top
+    elif vertical_sub_pos == "bottom":
+        subs_margin_px = subs_margin_bottom
+    else:
+        # Keep legacy center vertical shift behavior.
+        subtitle_vshift = _coerce_int(
+            config.get("subtitle_vshift"),
+            default=0,
+            key="subtitle_vshift",
+            min_value=-1920,
+        )
+        subs_margin_px = subs_margin_default + subtitle_vshift
+
+    print(
+        f"[subtitles] position={subtitle_position} align={subtitle_alignment} "
+        f"font={subs_font_name} fontfile={subtitle_fontfile or 'default'} "
+        f"font_size={subs_fontsize_px} outline={subs_outline_px} margin_v={subs_margin_px}"
+    )
+
+    margin_min = -300 if vertical_sub_pos == "middle" else 0
     subs_style = (
         f"FontName={subs_font_name},"
         f"FontSize={px_to_ass(subs_fontsize_px)},"
@@ -1113,7 +1468,7 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
         f"Outline={px_to_ass(subs_outline_px)},"
         "Shadow=0,"
         f"Alignment={subtitle_alignment},"
-        f"MarginV={px_to_ass(subtitle_margin_v, min_v=-300)}"
+        f"MarginV={px_to_ass(subs_margin_px, min_v=margin_min)}"
     )
 
     # Title y position inside top bar
@@ -1709,20 +2064,105 @@ def main() -> int:
 
         print("[2/3] 자막 생성" if external_audio else "[2/4] 자막 생성")
         duration = probe_duration(audio, ffprobe=resolve_bin(config, "ffprobe_bin", "ffprobe"))
-        if (not srt.exists() or srt.stat().st_size == 0) and bool(config.get("subtitle_align_openai", True)) and not external_audio:
-            # Best quality: align subtitles to actual narration audio.
-            write_srt_aligned_openai(
-                config,
-                audio_path=audio,
-                srt_path=srt,
-                prompt_text=job.script or "",
-                script_text=job.script or "",
-            )
-        else:
-            # Default to a denser split for better mobile readability.
-            max_chars = int(config.get("subtitle_max_chars", 26))
-            lines = split_for_captions_dense(job.script or "", max_chars=max_chars) or split_for_captions(job.script or "")
-            write_srt(lines, duration, srt)
+        subtitle_sync_tolerance = _coerce_float(
+            config.get("subtitle_sync_drift_tolerance"),
+            default=0.5,
+            key="subtitle_sync_drift_tolerance",
+        )
+        subtitle_sync_repair = _coerce_bool(config.get("subtitle_sync_repair"), default=True)
+        subtitle_sync_repair_max_drift = _coerce_float(
+            config.get("subtitle_sync_repair_max_drift"),
+            default=subtitle_sync_tolerance,
+            key="subtitle_sync_repair_max_drift",
+        )
+        subtitle_sync_max_scale_delta = _coerce_float(
+            config.get("subtitle_sync_max_scale_delta"),
+            default=0.12,
+            key="subtitle_sync_max_scale_delta",
+        )
+        if subtitle_sync_max_scale_delta < 0:
+            print("[-] subtitle_sync_max_scale_delta is negative; using 0.12")
+            subtitle_sync_max_scale_delta = 0.12
+        if subtitle_sync_max_scale_delta > 1:
+            print("[-] subtitle_sync_max_scale_delta is too large; clamping to 1.0")
+            subtitle_sync_max_scale_delta = 1.0
+
+        subtitle_ok = False
+        subtitle_method = "none"
+
+        # 1) OpenAI alignment (best sync)
+        if (not external_audio) and bool(config.get("subtitle_align_openai", True)):
+            try:
+                print("[2-1/4] OpenAI 자막 정렬 시도")
+                write_srt_aligned_openai(
+                    config,
+                    audio_path=audio,
+                    srt_path=srt,
+                    prompt_text=job.script or "",
+                    script_text=job.script or "",
+                )
+                if _apply_srt_timing_guard(
+                    srt,
+                    duration,
+                    enabled=subtitle_sync_repair,
+                    repair_max_drift=subtitle_sync_repair_max_drift,
+                    max_scale_delta=subtitle_sync_max_scale_delta,
+                    validate_max_drift=subtitle_sync_tolerance,
+                    label="openai",
+                ):
+                    subtitle_ok = True
+                    subtitle_method = "openai"
+                else:
+                    print(
+                        f"[-] OpenAI 자막이 오디오 길이와 동기화되지 않았습니다. "
+                        f"(허용 오차 {subtitle_sync_tolerance:.2f}s). fallback 진행"
+                    )
+            except Exception as e:
+                print(f"[-] OpenAI 자막 정렬 실패: {e}")
+
+        # 2) If OpenAI path is disabled/실패, accept Edge timing only if valid.
+        if (not subtitle_ok) and (not external_audio) and bool(config.get("subtitle_align_edge", True)):
+            if srt.exists() and srt.stat().st_size > 0:
+                if _apply_srt_timing_guard(
+                    srt,
+                    duration,
+                    enabled=subtitle_sync_repair,
+                    repair_max_drift=subtitle_sync_repair_max_drift,
+                    max_scale_delta=subtitle_sync_max_scale_delta,
+                    validate_max_drift=subtitle_sync_tolerance,
+                    label="edge",
+                ):
+                    subtitle_ok = True
+                    subtitle_method = "edge"
+                else:
+                    print("[-] Edge 자막도 동기화 검증에 실패해 fallback 분기로 이동")
+            else:
+                print("[-] Edge 자막 파일이 비어 있어 fallback 분기로 이동")
+
+        # 3) Final fallback: text split aligned only by script duration.
+        if not subtitle_ok:
+            try:
+                print("[2-2/4] 스크립트 기반 자막 분할 fallback")
+                max_chars = _coerce_int(config.get("subtitle_max_chars"), default=26, key="subtitle_max_chars", min_value=4)
+                lines = split_for_captions_dense(job.script or "", max_chars=max_chars) or split_for_captions(job.script or "")
+                write_srt(lines, duration, srt)
+                if _apply_srt_timing_guard(
+                    srt,
+                    duration,
+                    enabled=subtitle_sync_repair,
+                    repair_max_drift=subtitle_sync_repair_max_drift,
+                    max_scale_delta=subtitle_sync_max_scale_delta,
+                    validate_max_drift=subtitle_sync_tolerance,
+                    label="script_split",
+                ):
+                    subtitle_ok = True
+                    subtitle_method = "script_split"
+                else:
+                    raise RuntimeError("script-based subtitles were out of sync")
+            except Exception as e:
+                raise RuntimeError(f"Could not generate valid subtitles: {e}") from e
+
+        print(f"[i] Subtitles ready: source={subtitle_method}, sync_tolerance={subtitle_sync_tolerance:.2f}s")
 
         print("[3/3] 영상 렌더링" if external_audio else "[3/4] 영상 렌더링")
         bg, credit_line = ensure_background_for_job(config, job, duration_s=duration, out_path=bg_out)
