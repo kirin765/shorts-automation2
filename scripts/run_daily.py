@@ -6,6 +6,7 @@ import json
 import re
 import subprocess
 from datetime import date
+from datetime import datetime
 from pathlib import Path
 
 
@@ -52,12 +53,13 @@ def main() -> int:
     queue_dir.mkdir(parents=True, exist_ok=True)
 
     today = date.today().strftime("%Y-%m-%d")
+    run_stamp = datetime.now().strftime("%H%M%S_%f")
     n = max(1, min(args.count, len(topics)))
 
     created: list[Path] = []
     for i in range(n):
         topic = topics[i].strip()
-        name = f"{today}_{slug(topic)[:40]}_{i+1:02d}.json"
+        name = f"{today}_{run_stamp}_{slug(topic)[:40]}_{i+1:02d}.json"
         p = queue_dir / name
         payload: dict = {"topic": topic, "target_seconds": args.target_seconds}
         if args.style:

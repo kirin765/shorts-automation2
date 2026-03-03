@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 set -euo pipefail
 
 # Wrapper intended for cron/Task Scheduler.
@@ -33,9 +33,14 @@ CONFIG="${CONFIG:-ENV}"
 COUNT="${COUNT:-1}"
 NO_UPLOAD="${NO_UPLOAD:-0}"   # 1 to skip upload
 TARGET_SECONDS="${TARGET_SECONDS:-28}"
-NICHE="${NICHE:-테크/AI/인터넷 트렌드}"
-STYLE="${STYLE:-테크 뉴스, 한 문장 짧게}"
-TONE="${TONE:-빠르고 자신있게}"
+NICHE="${NICHE:-?뚰겕/AI/?명꽣???몃젋??"
+STYLE="${STYLE:-?뚰겕 ?댁뒪, ??臾몄옣 吏㏐쾶}"
+TONE="${TONE:-鍮좊Ⅴ怨??먯떊?덇쾶}"
+GEN_TOPIC_COUNT="${GEN_TOPIC_COUNT:-10}"
+
+if [[ "$COUNT" -gt "$GEN_TOPIC_COUNT" ]]; then
+  GEN_TOPIC_COUNT="$COUNT"
+fi
 
 if [[ -f ".venv/bin/activate" ]]; then
   # shellcheck disable=SC1091
@@ -46,9 +51,21 @@ python3 scripts/generate_topics.py \
   --config "$CONFIG" \
   --out jobs/topics.txt \
   --history jobs/topics_history.txt \
-  --count 10 \
+  --count "$GEN_TOPIC_COUNT" \
   --niche "$NICHE" \
   --style "$STYLE"
+
+topic_count="$(
+  grep -Ev '^\s*(#|$)' jobs/topics.txt 2>/dev/null | wc -l | tr -d ' '
+)"
+required_count="$COUNT"
+if [[ -z "$topic_count" ]]; then
+  topic_count="0"
+fi
+if [[ "$topic_count" -lt "$required_count" ]]; then
+  echo "topic generation failed to provide unique set (got $topic_count, need $required_count)"
+  exit 1
+fi
 
 cmd=(python3 scripts/run_daily.py --config "$CONFIG" --topics-file jobs/topics.txt --count "$COUNT" --target-seconds "$TARGET_SECONDS" --style "$STYLE" --tone "$TONE")
 if [[ "$NO_UPLOAD" == "1" ]]; then
