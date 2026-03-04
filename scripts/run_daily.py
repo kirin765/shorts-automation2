@@ -17,13 +17,24 @@ def slug(s: str) -> str:
     return s or "topic"
 
 
-def read_topics(path: Path) -> list[str]:
-    topics: list[str] = []
+def split_topic_and_subtopic(line: str) -> tuple[str, str]:
+    raw = line.strip()
+    if "\t" in raw:
+        main, subtopic = raw.split("\t", 1)
+        return main.strip(), subtopic.strip()
+    if " | " in raw:
+        main, subtopic = raw.split(" | ", 1)
+        return main.strip(), subtopic.strip()
+    return raw, ""
+
+
+def read_topics(path: Path) -> list[tuple[str, str]]:
+    topics: list[tuple[str, str]] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        topics.append(line)
+        topics.append(split_topic_and_subtopic(line))
     return topics
 
 
@@ -41,11 +52,11 @@ def main() -> int:
     ap.add_argument("--run-queue", default="scripts/run_queue.sh")
     args = ap.parse_args()
 
-    topics: list[str] = []
+    topics: list[tuple[str, str]] = []
     if args.topics_file:
         topics.extend(read_topics(Path(args.topics_file)))
     if args.topic:
-        topics.extend([t for t in args.topic if t and t.strip()])
+        topics.extend((t.strip(), "") for t in args.topic if t and t.strip())
     if not topics:
         raise SystemExit("No topics. Use --topic or --topics-file.")
 
@@ -58,10 +69,19 @@ def main() -> int:
 
     created: list[Path] = []
     for i in range(n):
-        topic = topics[i].strip()
-        name = f"{today}_{run_stamp}_{slug(topic)[:40]}_{i+1:02d}.json"
+        topic, subtopic = topics[i]
+        topic_key = topic
+        if not topic_key:
+            continue
+        if subtopic:
+            filename_seed = f"{topic} {subtopic}"
+        else:
+            filename_seed = topic
+        name = f"{today}_{run_stamp}_{slug(filename_seed)[:40]}_{i+1:02d}.json"
         p = queue_dir / name
         payload: dict = {"topic": topic, "target_seconds": args.target_seconds}
+        if subtopic:
+            payload["subtopic"] = subtopic
         if args.style:
             payload["style"] = args.style
         if args.tone:

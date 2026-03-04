@@ -58,6 +58,43 @@ class TestRunDailyJobNaming(unittest.TestCase):
             self.assertEqual(payloads[0]["topic"], "same topic")
             self.assertEqual(payloads[1]["topic"], "same topic")
 
+    def test_parses_subtopic_from_tab_and_pipe_topics(self) -> None:
+        run_daily = _load_run_daily_module()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            queue_dir = root / "queue"
+            topics_file = root / "topics.txt"
+            topics_file.write_text("AI 최신 규제\t기업이 꼭 알아야 할 체크리스트\n디자인 | 색상 대비가 안 보일 때\n", encoding="utf-8")
+
+            argv = [
+                "run_daily.py",
+                "--config",
+                "ENV",
+                "--queue-dir",
+                str(queue_dir),
+                "--topics-file",
+                str(topics_file),
+                "--count",
+                "2",
+                "--run-queue",
+                "scripts/run_queue.sh",
+            ]
+
+            with patch.object(run_daily.subprocess, "call", return_value=0):
+                with patch.object(sys, "argv", argv):
+                    rc = run_daily.main()
+
+            self.assertEqual(rc, 0)
+            jobs = sorted(queue_dir.glob("*.json"))
+            self.assertEqual(len(jobs), 2)
+
+            payloads = [json.loads(p.read_text(encoding="utf-8")) for p in jobs]
+            self.assertEqual(payloads[0]["topic"], "AI 최신 규제")
+            self.assertEqual(payloads[0]["subtopic"], "기업이 꼭 알아야 할 체크리스트")
+            self.assertEqual(payloads[1]["topic"], "디자인")
+            self.assertEqual(payloads[1]["subtopic"], "색상 대비가 안 보일 때")
+
 
 if __name__ == "__main__":
     unittest.main()

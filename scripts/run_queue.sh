@@ -9,13 +9,14 @@ LOG_DIR="logs"
 RETRIES=3
 SLEEP_S=3
 NO_UPLOAD=0
+CLEANUP_ALL_ARTIFACTS=0
 LAST_RESULT_LINE=""
 
 usage() {
   cat <<'EOF'
 Usage:
   scripts/run_queue.sh [--config config.json] [--queue-dir jobs/queue] [--no-upload]
-                       [--retries 3] [--sleep 3] [--done-dir jobs/done] [--failed-dir jobs/failed]
+                       [--cleanup-all-artifacts] [--retries 3] [--sleep 3] [--done-dir jobs/done] [--failed-dir jobs/failed]
 
 Behavior:
   - Runs each *.json in the queue directory (sorted) through run_short.py
@@ -35,6 +36,7 @@ while [[ $# -gt 0 ]]; do
     --retries) RETRIES="$2"; shift 2 ;;
     --sleep) SLEEP_S="$2"; shift 2 ;;
     --no-upload) NO_UPLOAD=1; shift ;;
+    --cleanup-all-artifacts) CLEANUP_ALL_ARTIFACTS=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 2 ;;
   esac
@@ -46,21 +48,29 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="$LOG_DIR/run_queue_${STAMP}.log"
 
 python_cmd() {
-  if [[ -f ".venv/bin/activate" ]]; then
-    # shellcheck disable=SC1091
-    . .venv/bin/activate
-  fi
-
-  local py_bin="python"
-  if ! command -v "$py_bin" >/dev/null 2>&1; then
-    py_bin="python3"
-  fi
-  if ! command -v "$py_bin" >/dev/null 2>&1; then
-    echo "python interpreter not found (python/python3)" >&2
+  local py_bin="python3"
+  if [[ -x ".venv/bin/python" ]]; then
+    py_bin=".venv/bin/python"
+  elif command -v python >/dev/null 2>&1; then
+    py_bin="python"
+  elif ! command -v "$py_bin" >/dev/null 2>&1; then
+    echo "python interpreter not found (python/python3/.venv/bin/python)" >&2
     return 127
   fi
 
-  "$py_bin" -u run_short.py --config "$CONFIG" --job "$1" $([[ $NO_UPLOAD -eq 1 ]] && echo "--no-upload" || true)
+  local cleanup_flag=()
+  if [[ "$CLEANUP_ALL_ARTIFACTS" -eq 1 ]]; then
+    cleanup_flag=(--cleanup-all-artifacts)
+  fi
+  local no_upload_flag=()
+  if [[ "$NO_UPLOAD" -eq 1 ]]; then
+    no_upload_flag=(--no-upload)
+  fi
+  local notify_on_failure="$1"
+  local job="$2"
+
+  OPENCLAW_NOTIFY_ON_FAILURE="$notify_on_failure" \
+  "$py_bin" -u run_short.py --config "$CONFIG" --job "$job" "${cleanup_flag[@]}" "${no_upload_flag[@]}"
 }
 
 run_job() {
@@ -72,8 +82,13 @@ run_job() {
 
   for attempt in $(seq 1 "$RETRIES"); do
     echo "=== JOB ${base} (attempt ${attempt}/${RETRIES}) ==="
+    local notify_on_failure=1
+    if [[ "$attempt" -lt "$RETRIES" ]]; then
+      notify_on_failure=0
+    fi
+
     set +e
-    python_cmd "$job" 2>&1 | tee "$tmp_out"
+    python_cmd "$notify_on_failure" "$job" 2>&1 | tee "$tmp_out"
     local rc="${PIPESTATUS[0]}"
     set -e
 

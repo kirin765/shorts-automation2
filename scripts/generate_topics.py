@@ -6,6 +6,9 @@ import json
 import os
 from datetime import date
 from pathlib import Path
+import re
+from typing import Any
+from xml.etree import ElementTree as ET
 
 import requests
 
@@ -39,6 +42,202 @@ def _response_text(data: dict) -> str:
     raise RuntimeError("OpenAI response: no output text found")
 
 
+def _coerce_int(value: object, *, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_str(value: object, *, default: str = "") -> str:
+    text = (str(value).strip() if value is not None else "")
+    return text or default
+
+
+def _coerce_list(value: object, *, default: list[str] | None = None) -> list[str]:
+    if default is None:
+        default = []
+    if value is None:
+        return default[:]
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, (list, tuple)):
+        out: list[str] = []
+        for item in value:
+            text = str(item).strip() if item is not None else ""
+            if text:
+                out.append(text)
+        return out
+    return default[:]
+
+
+_LOW_INTEREST_MARKERS = {
+    "test",
+    "sample",
+    "dummy",
+    "placeholder",
+    "todo",
+    "temp",
+    "template",
+    "random",
+    "generic",
+    "basic",
+    "기본",
+    "테스트",
+    "샘플",
+}
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _normalize_topic_key(line: str) -> str:
+    main, sub = _split_topic_and_subtopic(line)
+    return _normalize_text(main).casefold()
+
+
+def _split_topic_and_subtopic(line: str) -> tuple[str, str]:
+    raw = _normalize_text(line).replace("\r", "")
+    if "\t" in raw:
+        main, sub = raw.split("\t", 1)
+        return main.strip(), sub.strip()
+    if " | " in raw:
+        main, sub = raw.split(" | ", 1)
+        return main.strip(), sub.strip()
+    return raw, ""
+
+
+def _is_high_interest_topic(topic: str) -> bool:
+    """Heuristic guard for obviously low-value generated topics."""
+    topic_norm = _normalize_text(_split_topic_and_subtopic(topic)[0]).lower()
+    if not topic_norm:
+        return False
+
+    # Reject obvious placeholders and empty garbage.
+    tokens = set(topic_norm.replace("-", " ").split())
+    if len(topic_norm) < 8:
+        return False
+    if any(mark in topic_norm for mark in _LOW_INTEREST_MARKERS):
+        return False
+    if len(tokens) == 1 and all(len(t) < 5 for t in tokens):
+        return False
+    if not re.search(r"[?！!?.:：]", topic_norm):
+        # Encourage a curiosity hook, practical angle, or comparative framing.
+        hook_words = {
+            "why",
+            "how",
+            "what",
+            "when",
+            "누구",
+            "왜",
+            "어떻게",
+            "무엇",
+            "어디",
+            "진짜",
+            "비밀",
+            "주의",
+            "오류",
+            "실수",
+            "차이",
+            "비교",
+            "방법",
+        }
+        if not any(w in topic_norm for w in hook_words):
+            # At least 2 words gives enough structure for a usable hook.
+            if len(topic_norm.split()) < 2:
+                return False
+            if not any(ch.isdigit() for ch in topic_norm):
+                return False
+
+        if len(topic_norm) > 80:
+            return False
+    return True
+
+
+def fetch_google_trending_topics(cfg: dict, *, geo: str, limit: int, timeout_s: int) -> list[str]:
+    # Unofficial RSS endpoint without API key.
+    url = "https://trends.google.com/trendingsearches/daily/rss"
+    response = requests.get(url, params={"geo": geo, "hl": "ko"}, timeout=timeout_s)
+    response.raise_for_status()
+    root = ET.fromstring(response.text)
+    out: list[str] = []
+    for item in root.findall(".//item"):
+        title = _normalize_text(item.findtext("title"))
+        if not title:
+            continue
+        out.append(title)
+        if len(out) >= max(1, limit):
+            break
+    if not out:
+        raise RuntimeError("Google Trends RSS returned no topics")
+    return out
+
+
+def fetch_youtube_trending_topics(cfg: dict, *, geo: str, limit: int, timeout_s: int) -> list[str]:
+    key = (
+        cfg.get("google_api_key")
+        or cfg.get("youtube_api_key")
+        or os.environ.get("GOOGLE_API_KEY")
+        or os.environ.get("YOUTUBE_API_KEY")
+        or ""
+    ).strip()
+    if not key:
+        raise RuntimeError("No API key for YouTube trends. Set GOOGLE_API_KEY or YOUTUBE_API_KEY.")
+
+    params = {
+        "part": "snippet",
+        "chart": "mostPopular",
+        "regionCode": geo,
+        "maxResults": max(1, min(20, limit)),
+        "key": key,
+    }
+    response = requests.get("https://www.googleapis.com/youtube/v3/videos", params=params, timeout=timeout_s)
+    response.raise_for_status()
+    data: dict[str, Any] = response.json()
+    out: list[str] = []
+    for item in data.get("items", []) or []:
+        title = _normalize_text((item.get("snippet") or {}).get("title"))
+        if title:
+            out.append(title)
+        if len(out) >= max(1, limit):
+            break
+    if not out:
+        raise RuntimeError("YouTube trending returned no titles")
+    return out
+
+
+def collect_trend_seeds(cfg: dict) -> list[str]:
+    sources = _coerce_list(cfg.get("trend_sources"), default=["google", "youtube"])
+    geo = _coerce_str(cfg.get("trend_region"), default="KR")
+    limit = _coerce_int(cfg.get("trend_seed_count", 8), default=8)
+    timeout_s = _coerce_int(cfg.get("trend_timeout_s", 12), default=12)
+
+    providers = {
+        "google": fetch_google_trending_topics,
+        "youtube": fetch_youtube_trending_topics,
+    }
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        fn = providers.get(source.lower())
+        if not fn:
+            print(f"[topics] unknown trend source skipped: {source!r}")
+            continue
+        try:
+            for item in fn(cfg, geo=geo, limit=limit, timeout_s=timeout_s):
+                key = _normalize_topic_key(item)
+                if not key or key in seen:
+                    continue
+                out.append(item)
+                seen.add(key)
+        except Exception as exc:
+            print(f"[topics] trend source failed: source={source!r} {exc}")
+            continue
+    return out
+
+
 def request_topics_once(
     *,
     base_url: str,
@@ -53,6 +252,7 @@ def request_topics_once(
     today: str,
     request_count: int,
     avoid_topics: list[str],
+    trend_seeds: list[str],
 ) -> list[str]:
     schema = {
         "type": "object",
@@ -69,10 +269,13 @@ def request_topics_once(
     }
 
     avoid_tail = "\n".join(f"- {t}" for t in avoid_topics[-120:])
+    trend_tail = "\n".join(f"- {t}" for t in trend_seeds) if trend_seeds else "(none)"
     system = (
         "You generate high-retention YouTube Shorts topic ideas. "
         "Do not include emojis. Do not include hashtags. "
         "Avoid precise claims that need fact-checking. "
+        "Prioritize curiosity-driven, practical, and discussion-worthy topics. "
+        "Avoid generic placeholders like 'topic x', 'daily update', or bland one-liners. "
         "Output only valid JSON matching the schema."
     )
     user = (
@@ -80,8 +283,14 @@ def request_topics_once(
         f"Niche: {niche}\n"
         f"Style: {style}\n"
         f"Date: {today}\n"
-        f"Generate {request_count} topics. Each topic should be one line, <= 35 characters if Korean.\n"
+        f"Generate {request_count} topics in this exact format: main_topic\\tsubtopic.\n"
+        "Keep each item short and practical.\n"
         "Prefer topics that can be explained in ~25-35 seconds.\n"
+        "Prioritize strong hooks (why/why now/how to/hidden mistake). "
+        "Include concrete situations, decisions, comparisons, numbers, or clear mistakes.\n"
+        "Avoid generic placeholders or reworded duplicates like 'daily update', 'topic idea', 'news', 'misc'.\n"
+        "Use these trend seeds:\n"
+        f"{trend_tail}\n"
         "Avoid repeating these recent topics:\n"
         f"{avoid_tail if avoid_tail else '(none)'}\n"
     )
@@ -150,6 +359,7 @@ def main() -> int:
     max_attempts = int(args.max_attempts or cfg.get("openai_topic_max_attempts", 5))
     if max_attempts < 1:
         raise SystemExit(f"--max-attempts must be >= 1 (got {max_attempts})")
+    trend_seeds = collect_trend_seeds(cfg)
 
     out_path = Path(args.out)
     hist_path = Path(args.history)
@@ -158,13 +368,13 @@ def main() -> int:
 
     existing = read_existing_topics(hist_path)
     accepted: list[str] = []
-    accepted_set: set[str] = set()
+    accepted_set: set[str] = {_normalize_topic_key(t) for t in existing}
     all_candidates: list[str] = []
     today = date.today().isoformat()
 
     print(
         f"[topics] policy mode={uniqueness_mode} target_count={args.count} max_attempts={max_attempts} "
-        f"history_size={len(existing)}"
+        f"history_size={len(existing)} trend_seeds={len(trend_seeds)}"
     )
 
     for attempt in range(1, max_attempts + 1):
@@ -188,6 +398,7 @@ def main() -> int:
                 today=today,
                 request_count=request_count,
                 avoid_topics=avoid_topics,
+                trend_seeds=trend_seeds,
             )
         except Exception as e:
             raise SystemExit(f"topic generation failed on attempt {attempt}/{max_attempts}: {e}") from e
@@ -196,14 +407,24 @@ def main() -> int:
             print(f"[topics] attempt {attempt}/{max_attempts}: no topics returned")
             continue
 
-        all_candidates.extend(batch)
+        high_interest_batch: list[str] = []
+        for raw in batch:
+            t = raw.strip()
+            if not t:
+                continue
+            if "\t" not in t and " | " in t:
+                t = t.replace(" | ", "\t", 1)
+            high_interest_batch.append(t)
+        high_interest_batch = [t for t in high_interest_batch if _is_high_interest_topic(t)]
+        all_candidates.extend(high_interest_batch)
         added_this_attempt = 0
-        for topic in batch:
-            if topic in accepted_set:
+        for topic in high_interest_batch:
+            key = _normalize_topic_key(topic)
+            if not key or key in accepted_set:
                 continue
-            if uniqueness_mode == "strict" and topic in existing:
+            if uniqueness_mode == "strict" and key in {_normalize_topic_key(t) for t in existing}:
                 continue
-            accepted_set.add(topic)
+            accepted_set.add(key)
             accepted.append(topic)
             added_this_attempt += 1
             if len(accepted) >= args.count:
@@ -216,9 +437,10 @@ def main() -> int:
 
     if len(accepted) < args.count and uniqueness_mode == "best_effort":
         for topic in all_candidates:
-            if topic in accepted_set:
+            key = _normalize_topic_key(topic)
+            if not key or key in accepted_set:
                 continue
-            accepted_set.add(topic)
+            accepted_set.add(key)
             accepted.append(topic)
             if len(accepted) >= args.count:
                 break

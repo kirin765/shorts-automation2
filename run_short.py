@@ -4,9 +4,11 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import textwrap
+import traceback
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -30,6 +32,7 @@ class Job:
     style: str | None = None
     tone: str | None = None
     target_seconds: int | None = None
+    subtopic: str | None = None
 
 
 def run(cmd: list[str]) -> None:
@@ -194,6 +197,20 @@ def _coerce_bool(value, *, default: bool = False) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return bool(value)
+
+
+def _resolve_openai_language(value: object) -> str:
+    """Normalize optional OpenAI language settings.
+
+    Returns an empty string for unset/blank/auto/none values so callers can
+    rely on API-side language auto-detection.
+    """
+    raw = "" if value is None else str(value).strip()
+    if not raw:
+        return ""
+    if raw.lower() in {"auto", "none"}:
+        return ""
+    return raw
 
 
 def _cleanup_paths(paths: Iterable[Path], *, preserve: set[Path] | None = None) -> None:
@@ -549,7 +566,7 @@ def write_srt_aligned_openai(
     base_url = (config.get("openai_base_url") or "https://api.openai.com/v1").rstrip("/")
     model = (config.get("openai_transcribe_model") or "whisper-1").strip()
     timeout_s = int(config.get("openai_transcribe_timeout_s", 60))
-    lang = (config.get("openai_transcribe_language") or config.get("default_language") or "").strip()
+    transcribe_lang = _resolve_openai_language(config.get("openai_transcribe_language"))
 
     files = {"file": (audio_path.name, audio_path.read_bytes(), "audio/mpeg")}
     data = {
@@ -557,9 +574,9 @@ def write_srt_aligned_openai(
         "response_format": "verbose_json",
         "prompt": (prompt_text or "")[:4000],
     }
-    if lang:
+    if transcribe_lang:
         # API expects ISO language codes like "ko", "en".
-        data["language"] = lang
+        data["language"] = transcribe_lang
     # Ask for word-level timestamps when supported.
     # The API accepts repeated timestamp_granularities[] keys in multipart form.
     data["timestamp_granularities[]"] = ["word", "segment"]
@@ -880,42 +897,63 @@ def openai_generate_job(config: dict, job: Job) -> Job:
 
     api_key = _openai_api_key(config)
     base_url = (config.get("openai_base_url") or "https://api.openai.com/v1").rstrip("/")
-    model = (config.get("openai_model") or "gpt-4o-mini").strip()
+    model = (config.get("openai_script_model") or config.get("openai_model") or "gpt-4o-mini").strip()
     timeout_s = int(config.get("openai_timeout_s", 40))
     temperature = float(config.get("openai_temperature", 0.7))
     max_tokens = int(config.get("openai_max_output_tokens", 650))
 
-    language = (config.get("openai_language") or config.get("default_language") or "ko").strip()
+    language = _resolve_openai_language(config.get("openai_script_language"))
+    if not language:
+        language = _resolve_openai_language(config.get("openai_language"))
+    if not language:
+        language = str(config.get("default_language", "")).strip() or ""
     target_seconds = int(job.target_seconds or config.get("shorts_target_seconds", 28))
 
     topic = (job.topic or job.title or "").strip()
     if not topic:
         topic = "shorts topic"
+    subtopic = (job.subtopic or "").strip()
 
     # Avoid hallucinated hard facts; keep it general unless user supplies facts in the topic.
     system = (
-        "You write high-retention YouTube Shorts scripts (Korean). "
+        "You write high-retention YouTube Shorts scripts. "
         "Do not invent precise statistics, dates, prices, quotes, or named sources. "
-        "If you need numbers, use vague ranges (e.g., '?섏떗??, '紐?諛?) or omit them. "
+        "If you need numbers, use vague ranges (e.g., 'around 10~20%', '일부 사용자 10~20%') or omit them. "
+        "Use natural Korean sentence style in the output. "
         "Keep sentences short and punchy. Output must be valid JSON matching the provided schema."
     )
+    user_parts = [
+        f"Topic: {topic}",
+    ]
+    if subtopic:
+        user_parts.append(f"Subtopic: {subtopic}")
+    user_parts.extend(
+        [
+        f"Style: {job.style or 'tech news / explain like I am busy'}",
+        f"Tone: {job.tone or 'confident, concise'}",
+        f"Target duration: about {target_seconds} seconds of narration.",
+        "Use topic/subtopic phrasing as context, then write one clear title and script."
+    ])
+    if language:
+        user_parts.insert(0, f"Language: {language}")
     user = (
-        f"Language: {language}\n"
-        f"Topic: {topic}\n"
-        f"Style: {job.style or 'tech news / explain like I am busy'}\n"
-        f"Tone: {job.tone or 'confident, concise'}\n"
-        f"Target duration: about {target_seconds} seconds of narration.\n"
-        "Output rules:\n"
-        "- title: <= 28 chars, curiosity-driven, no clickbait lies.\n"
-        "- script: 5-7 sentences total. First sentence must be the hook.\n"
-        "- script: avoid long clauses; prefer short lines that are easy to subtitle.\n"
-        "- description: 1-2 sentences summary.\n"
-        "- hashtags: 3-5 tags including #shorts.\n"
-        "- pexels_query: 4-8 English words, no brand names.\n"
-        "Structure:\n"
-        "1) Hook\n"
-        "2) 3-5 beats (each beat 1 sentence)\n"
-        "3) Wrap-up + subtle CTA (e.g., '???뚭퀬 ?띠쑝硫????)\n"
+        "\n".join(user_parts)
+        + "\n"
+        + "\n".join(
+            [
+                "Output rules:",
+                "- title: <= 28 chars, curiosity-driven, no clickbait lies.",
+                "- script: 5-7 sentences total. First sentence must be the hook.",
+                "- script: avoid long clauses; prefer short lines that are easy to subtitle.",
+                "- description: 1-2 sentences summary.",
+                "- hashtags: 3-5 tags including #shorts.",
+                "- pexels_query: 4-8 English words, no brand names.",
+                "Structure:",
+                "1) Hook",
+                "2) 3-5 beats (each beat 1 sentence)",
+                "3) Wrap-up + subtle CTA (e.g., '???뚭퀬 ?띠쑝硫????)",
+            ]
+        )
     )
 
     schema = {
@@ -989,6 +1027,7 @@ def openai_generate_job(config: dict, job: Job) -> Job:
         style=job.style,
         tone=job.tone,
         target_seconds=job.target_seconds,
+        subtopic=job.subtopic,
     )
 
 
@@ -1006,7 +1045,7 @@ def guess_pexels_query(job: Job) -> str:
     if (job.pexels_query or "").strip():
         return (job.pexels_query or "").strip()
 
-    t = f"{job.title or ''} {job.script or ''} {job.topic or ''}".lower()
+    t = f"{job.subtopic or ''} {job.topic or ''} {job.title or ''} {job.script or ''}".lower()
     # Cheap topic heuristics: Pexels search works best with English keywords.
     if "ai.com" in t or "ai" in t or "인공지능" in t:
         return "artificial intelligence abstract technology"
@@ -1886,6 +1925,7 @@ def load_job(path: Path) -> Job:
         hashtags=data.get("hashtags"),
         pexels_query=data.get("pexels_query"),
         topic=data.get("topic"),
+        subtopic=data.get("subtopic"),
         style=data.get("style"),
         tone=data.get("tone"),
         target_seconds=data.get("target_seconds"),
@@ -1904,16 +1944,18 @@ def ensure_job_ready(config: dict, job: Job, *, allow_llm: bool) -> Job:
     if not (job.hashtags or "").strip():
         needs.append("hashtags")
 
-    if not needs:
-        if not allow_llm:
-            return job
-        needs = ["title", "script", "description", "hashtags"]
-
     if not allow_llm:
-        raise RuntimeError(f"???뚯씪??{', '.join(needs)}媛 ?놁뒿?덈떎. ?먮룞 ?앹꽦??爰쇱졇?덉뒿?덈떎(--no-llm).")
+        if needs:
+            raise RuntimeError(f"Missing required fields from job: {', '.join(needs)}. Use --no-llm to allow this.")
+        return job
+
+    if not needs:
+        return job
 
     print(f"[0/4] Regenerating title/script via OpenAI")
     seed_topic = (job.topic or "").strip() or (job.title or "").strip() or (job.script or "").strip() or "shorts topic"
+    if job.subtopic:
+        seed_topic = f"{seed_topic}: {job.subtopic.strip()}"
     if len(seed_topic) > 80:
         seed_topic = seed_topic[:80].strip()
 
@@ -1924,6 +1966,7 @@ def ensure_job_ready(config: dict, job: Job, *, allow_llm: bool) -> Job:
         hashtags=None,
         pexels_query=job.pexels_query,
         topic=seed_topic,
+        subtopic=job.subtopic,
         style=job.style,
         tone=job.tone,
         target_seconds=job.target_seconds,
@@ -2001,6 +2044,101 @@ def _env_truthy(name: str) -> bool:
 def _summary_line(summary: dict[str, Any]) -> str:
     payload = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
     return f"SUMMARY {payload}"
+
+
+def _coerce_openclaw_notify_flag(config: dict[str, Any], *, env_key: str, config_key: str, default: bool = False) -> bool:
+    if env_key in os.environ:
+        return _env_truthy(env_key)
+    return _coerce_bool(config.get(config_key), default=default)
+
+
+def _openclaw_log_path(config: dict[str, Any]) -> Path:
+    raw = (config.get("openclaw_error_log_path") or os.environ.get("OPENCLAW_ERROR_LOG_PATH") or "").strip()
+    if raw:
+        return Path(raw)
+    return Path("logs") / "errors.jsonl"
+
+
+def _read_tail_lines(path: Path, max_lines: int = 20) -> list[str]:
+    if max_lines <= 0 or not path.exists():
+        return []
+    lines: list[str] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                lines.append(line.rstrip("\n"))
+    except Exception:
+        return []
+
+    return lines[-max_lines:]
+
+
+def _log_error_event(config: dict[str, Any], payload: dict[str, Any]) -> None:
+    path = _openclaw_log_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        **payload,
+    }
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[-] Failed to write error log {path}: {_one_line(str(e))}")
+
+
+def _format_openclaw_message(*, status: str, job: str, error_type: str, error: str, result_line: str | None, log_file: Path | None) -> str:
+    base = [
+        "[shorts-automation2]",
+        f"status={status}",
+        f"job={job}",
+        f"error_type={error_type}",
+        f"error={error}",
+        f"result={result_line}" if result_line else "",
+        f"log={log_file}" if log_file else "",
+    ]
+    return " | ".join(part for part in base if part)
+
+
+def _notify_openclaw(message: str, *, config: dict[str, Any]) -> None:
+    notify_enabled = _coerce_openclaw_notify_flag(
+        config,
+        env_key="OPENCLAW_NOTIFY_ENABLED",
+        config_key="openclaw_notify_enabled",
+        default=False,
+    )
+    if not notify_enabled:
+        return
+
+    cmd_raw = str(config.get("openclaw_notify_cmd") or os.environ.get("OPENCLAW_NOTIFY_CMD") or "").strip()
+    if not cmd_raw:
+        print("[-] openclaw notify is enabled but openclaw_notify_cmd is empty.")
+        return
+
+    timeout_s = _coerce_float(config.get("openclaw_notify_timeout_s"), default=12.0, key="openclaw_notify_timeout_s")
+
+    quoted_message = shlex.quote(message)
+    if "{message}" in cmd_raw:
+        cmd_raw = cmd_raw.replace("{message}", quoted_message)
+    else:
+        cmd_raw = f"{cmd_raw} {quoted_message}"
+
+    try:
+        cmd = shlex.split(cmd_raw)
+    except Exception as e:
+        print(f"[-] openclaw notify command parse failed: {_one_line(str(e))}")
+        return
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=float(timeout_s))
+    except Exception as e:
+        print(f"[-] openclaw notify command failed: {_one_line(str(e))}")
+        return
+
+    if result.returncode != 0:
+        err = _one_line(result.stderr or result.stdout or "")
+        print(f"[-] openclaw notify command returned non-zero ({result.returncode}): {err}")
+
 
 
 def _run_ffprobe_json(ffprobe_bin: str, path: Path) -> dict[str, Any]:
@@ -2171,6 +2309,11 @@ def main() -> int:
         "--audio",
         help="Use an existing audio file (mp3/wav). If set, TTS generation is skipped.",
     )
+    parser.add_argument(
+        "--cleanup-all-artifacts",
+        action="store_true",
+        help="Delete all generated files after run, including final video outputs.",
+    )
     args = parser.parse_args()
     no_upload = bool(args.no_upload) or _env_truthy("NO_UPLOAD")
 
@@ -2189,7 +2332,10 @@ def main() -> int:
     generated_artifacts: list[Path] = []
     preserved_artifacts: set[Path] = set()
     keep_intermediate_artifacts: bool = False
+    cleanup_all_artifacts: bool = False
     out_dir: Path | None = None
+    config: dict[str, Any] = {}
+    trace_lines: list[str] = []
 
     try:
         config = load_config(args.config)
@@ -2203,13 +2349,17 @@ def main() -> int:
         keep_intermediate_artifacts = _coerce_bool(
             config.get("keep_intermediate_artifacts"), default=False
         )
+        cleanup_all_artifacts = bool(args.cleanup_all_artifacts) or _env_truthy("CLEANUP_ALL_ARTIFACTS")
+        if not cleanup_all_artifacts:
+            cleanup_all_artifacts = _coerce_bool(config.get("cleanup_all_artifacts"), default=False)
 
         external_audio = bool(args.audio)
         audio = Path(args.audio) if external_audio else (out_dir / f"{stamp}.mp3")
         srt = out_dir / f"{stamp}.srt"
         video = out_dir / f"{stamp}.mp4"
         bg_out = out_dir / f"{stamp}.bg.mp4"
-        preserved_artifacts.add(video)
+        if not cleanup_all_artifacts:
+            preserved_artifacts.add(video)
         generated_artifacts.append(srt)
         if external_audio:
             preserved_artifacts.add(audio)
@@ -2444,38 +2594,88 @@ def main() -> int:
         )
         return 0
     except Exception as e:
-        _print_summary(
-            {
-                "status": "error",
-                "elapsed_s": round(time.monotonic() - started, 3),
-                "job": str(job_path),
-                "stamp": stamp,
-                "no_upload": no_upload,
-                "video": str(video) if video else None,
-                "audio": str(audio) if audio else None,
-                "srt": str(srt) if srt else None,
-                "credits": str(credit_path) if credit_path else None,
-                "duration_s": round(float(duration), 3) if duration is not None else None,
-                "error_type": type(e).__name__,
-                "error": _one_line(str(e)),
-                "idempotency_hit": idempotency_hit,
-                "idempotency_key": idempotency_key,
-                "idempotency_state_file": idempotency_state_file,
-            }
+        trace_lines: list[str] = []
+        if args.traceback:
+            trace_lines = traceback.format_exc().splitlines()
+        error_summary = f"{type(e).__name__}: {e}"
+        summary_payload = {
+            "status": "error",
+            "elapsed_s": round(time.monotonic() - started, 3),
+            "job": str(job_path),
+            "stamp": stamp,
+            "no_upload": no_upload,
+            "video": str(video) if video else None,
+            "audio": str(audio) if audio else None,
+            "srt": str(srt) if srt else None,
+            "credits": str(credit_path) if credit_path else None,
+            "duration_s": round(float(duration), 3) if duration is not None else None,
+            "error_type": type(e).__name__,
+            "error": _one_line(str(e)),
+            "idempotency_hit": idempotency_hit,
+            "idempotency_key": idempotency_key,
+            "idempotency_state_file": idempotency_state_file,
+        }
+        if args.traceback:
+            summary_payload["traceback"] = _one_line(" | ".join(trace_lines))
+        _print_summary(summary_payload)
+        result_line = format_result_line(
+            status="error",
+            elapsed_s=(time.monotonic() - started),
+            video=video,
+            # Preserve video_id if upload succeeded but later steps failed
+            # (e.g., idempotency state persistence). This keeps RESULT lines
+            # actionable for reruns and debugging.
+            video_id=video_id,
+            upload_url=upload_url,
+            no_upload=no_upload,
+            error=error_summary,
         )
-        print(
-            format_result_line(
+        log_payload = {
+            "status": "error",
+            "job": str(job_path),
+            "stamp": stamp,
+            "no_upload": no_upload,
+            "video": str(video) if video else None,
+            "audio": str(audio) if audio else None,
+            "srt": str(srt) if srt else None,
+            "credits": str(credit_path) if credit_path else None,
+            "duration_s": round(float(duration), 3) if duration is not None else None,
+            "error_type": type(e).__name__,
+            "error": _one_line(str(e)),
+            "error_summary": error_summary,
+            "idempotency_hit": idempotency_hit,
+            "idempotency_key": idempotency_key,
+            "idempotency_state_file": idempotency_state_file,
+            "result_line": result_line,
+        }
+        if args.traceback:
+            log_payload["traceback"] = _one_line(" | ".join(trace_lines))
+        _log_error_event(config, log_payload)
+        should_notify = _coerce_openclaw_notify_flag(
+            config,
+            env_key="OPENCLAW_NOTIFY_ON_FAILURE",
+            config_key="openclaw_notify_on_failure",
+            default=True,
+        )
+        if should_notify:
+            log_path = _openclaw_log_path(config)
+            notify_tail_lines = _coerce_int(config.get("openclaw_notify_tail_lines"), default=20, key="openclaw_notify_tail_lines")
+            error_tail = _read_tail_lines(log_path, max_lines=notify_tail_lines)
+            notify_message = _format_openclaw_message(
                 status="error",
-                elapsed_s=(time.monotonic() - started),
-                video=video,
-                # Preserve video_id if upload succeeded but later steps failed
-                # (e.g., idempotency state persistence). This keeps RESULT lines
-                # actionable for reruns and debugging.
-                video_id=video_id,
-                upload_url=upload_url,
-                no_upload=no_upload,
-                error=f"{type(e).__name__}: {e}",
-            ),
+                job=str(job_path),
+                error_type=type(e).__name__,
+                error=_one_line(str(e)),
+                result_line=result_line,
+                log_file=log_path,
+            )
+            if error_tail:
+                notify_message = f"{notify_message} | log_tail={_one_line(' | '.join(error_tail))}"
+
+            _notify_openclaw(notify_message, config=config)
+
+        print(
+            result_line,
             flush=True,
         )
         if args.traceback:
@@ -2495,4 +2695,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

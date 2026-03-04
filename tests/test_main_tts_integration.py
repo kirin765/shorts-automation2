@@ -134,22 +134,25 @@ class TestMainTTSIntegration(unittest.TestCase):
                 },
             )
 
-            with patch.object(
-                sys,
-                "argv",
-                ["run_short.py", "--config", str(cfg_path), "--job", str(job_path), "--no-upload"],
-            ):
-                with (
-                    patch("run_short.tts_elevenlabs", side_effect=requests.Timeout("timed out")),
-                    patch(
-                        "run_short.openai_generate_job",
-                        return_value=run_short.Job(
-                            title="title", script="script", description="description", hashtags="#shorts", topic="topic"
-                        ),
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    ["run_short.py", "--config", str(cfg_path), "--job", str(job_path), "--no-upload"],
+                ),
+                patch(
+                    "run_short.tts_elevenlabs",
+                    side_effect=RuntimeError("elevenlabs_tts timeout after 40.0s: timed out"),
+                ),
+                patch(
+                    "run_short.openai_generate_job",
+                    return_value=run_short.Job(
+                        title="title", script="script", description="description", hashtags="#shorts", topic="topic"
                     ),
-                    patch("sys.stdout", new=io.StringIO()) as stdout_buf,
-                ):
-                    rc = run_short.main()
+                ),
+                patch("sys.stdout", new=io.StringIO()) as stdout_buf,
+            ):
+                rc = run_short.main()
 
             out = stdout_buf.getvalue()
             self.assertEqual(rc, 1)
@@ -171,8 +174,8 @@ class TestMainTTSIntegration(unittest.TestCase):
 
             captured: dict[str, object] = {}
 
-            def fake_tts(*_args: object, **_kwargs: object) -> None:
-                _kwargs["out_mp3"].write_bytes(b"mp3")
+            def fake_tts(_text: str, out_mp3: Path, **_kwargs: object) -> None:
+                out_mp3.write_bytes(b"mp3")
 
             def fake_background(config: dict, job: run_short.Job, *, duration_s: float, out_path: Path) -> tuple[Path, str | None]:
                 return Path(td) / "bg.mp4", None

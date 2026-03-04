@@ -215,6 +215,66 @@ class TestMainArtifactCleanup(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertTrue(any(str(p).endswith(".subs.ass") for p in output_dir.glob("*")))
 
+    def test_main_cleanup_all_artifacts_removes_video_and_intermediates(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            job_path = self._write_job(td)
+            cfg_path = self._write_config(td)
+            output_dir = Path(td) / "output"
+
+            def fake_tts(
+                text: str,
+                out_mp3: Path,
+                *,
+                voice_id: str,
+                api_key: str,
+                model_id: str,
+                timeout_s: float,
+            ) -> None:
+                out_mp3.write_bytes(b"mp3-data")
+
+            def fake_background(config: dict, job: run_short.Job, *, duration_s: float, out_path: Path):
+                out_path.write_bytes(b"bg")
+                return out_path, None
+
+            def fake_render(
+                bg: Path,
+                audio: Path,
+                srt: Path,
+                out_video: Path,
+                config: dict,
+                title_text: str,
+            ) -> None:
+                out_video.write_bytes(b"video-data")
+                out_video.with_suffix(".title.txt").write_text("title", encoding="utf-8")
+                out_video.with_suffix(".subs.ass").write_text("ass", encoding="utf-8")
+
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_short.py",
+                    "--config",
+                    str(cfg_path),
+                    "--job",
+                    str(job_path),
+                    "--no-upload",
+                    "--cleanup-all-artifacts",
+                ],
+            ):
+                with (
+                    patch("run_short.probe_duration", return_value=10.0),
+                    patch("run_short.ensure_background_for_job", side_effect=fake_background),
+                    patch("run_short.render_video", side_effect=fake_render),
+                    patch("run_short.tts_with_retries", side_effect=lambda fn, **_: fn()),
+                    patch("run_short.tts_elevenlabs", side_effect=fake_tts),
+                    patch("run_short._apply_srt_timing_guard", return_value=True),
+                    patch("sys.stdout", new=io.StringIO()),
+                ):
+                    rc = run_short.main()
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(list(output_dir.glob("*"))), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

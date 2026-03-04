@@ -18,11 +18,11 @@ class TestJobReadyNoPexelsQuery(unittest.TestCase):
         self.assertEqual(out.title, "t")
         self.assertIsNone(out.pexels_query)
 
-    def test_allow_llm_regenerates_existing_fields(self) -> None:
+    def test_allow_llm_regenerates_missing_fields(self) -> None:
         cfg = {"openai_api_key": "test-key"}
         job = run_short.Job(
             title="old title",
-            script="old script",
+            script=None,
             description="old description",
             hashtags="#old",
             pexels_query="preset query",
@@ -49,4 +49,3 @@ class TestJobReadyNoPexelsQuery(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
