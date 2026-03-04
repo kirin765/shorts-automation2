@@ -366,11 +366,20 @@ def _write_ass_from_srt(
     font_name: str,
     font_size: int,
     outline: int,
+    shadow: int,
     alignment: int,
     margin_v: int,
+    primary_colour: str,
+    secondary_colour: str,
+    outline_colour: str,
+    back_colour: str,
 ) -> None:
     cues = _read_srt_cues_for_ass(srt_path)
     ass_font_name = (font_name.split(",")[0].strip() if font_name else "") or "Noto Sans CJK KR"
+    primary = primary_colour
+    secondary = secondary_colour
+    outline_c = outline_colour
+    back = back_colour
 
     lines = [
         "[Script Info]",
@@ -385,8 +394,8 @@ def _write_ass_from_srt(
         (
             "Style: Default,"
             f"{ass_font_name},{int(font_size)},"
-            "&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,"
-            f"0,0,0,0,100,100,0,0,1,{int(outline)},0,{int(alignment)},20,20,{int(margin_v)},1"
+            f"{primary},{secondary},{outline_c},{back},"
+            f"0,0,0,0,100,100,0,0,1,{int(outline)},{int(shadow)},{int(alignment)},20,20,{int(margin_v)},1"
         ),
         "",
         "[Events]",
@@ -885,8 +894,7 @@ def _openai_api_key(config: dict) -> str:
     key = (config.get("openai_api_key") or os.environ.get("OPENAI_API_KEY") or "").strip()
     if not key:
         raise RuntimeError(
-            "?蹂??먮룞 ?앹꽦(OpenAI)???곕젮硫?API ?ㅺ? ?꾩슂?⑸땲?? "
-            "?섍꼍蹂??`OPENAI_API_KEY`瑜??ㅼ젙?섏꽭?? (?먮뒗 config??`openai_api_key`)"
+            "Missing OpenAI API key. Set env OPENAI_API_KEY (or config openai_api_key)."
         )
     return key
 
@@ -914,13 +922,16 @@ def openai_generate_job(config: dict, job: Job) -> Job:
         topic = "shorts topic"
     subtopic = (job.subtopic or "").strip()
 
-    # Avoid hallucinated hard facts; keep it general unless user supplies facts in the topic.
+    # Improve short-form retention by enforcing hook + proof + takeaway + CTA structure.
     system = (
-        "You write high-retention YouTube Shorts scripts. "
-        "Do not invent precise statistics, dates, prices, quotes, or named sources. "
-        "If you need numbers, use vague ranges (e.g., 'around 10~20%', '일부 사용자 10~20%') or omit them. "
-        "Use natural Korean sentence style in the output. "
-        "Keep sentences short and punchy. Output must be valid JSON matching the provided schema."
+        "You are a senior Korean YouTube Shorts copywriter focused on retention. "
+        "Only generate content that is clearly tied to the given topic/subtopic. "
+        "Do not invent precise statistics, dates, prices, named sources, or quotes. "
+        "If you need numerical context, use cautious ranges (예: '10~20% 정도', '10분의 1 수준'). "
+        "Write in natural, vivid Korean, short and punchy. "
+        "Prioritize uniqueness, emotional rhythm, and one concrete, memorable example. "
+        "Avoid boilerplate clichés such as '중요한 것은', '많은 사람들이', '많은 분들이', "
+        "'결국', '결국 중요한 건', and other generic motivational lines."
     )
     user_parts = [
         f"Topic: {topic}",
@@ -943,15 +954,17 @@ def openai_generate_job(config: dict, job: Job) -> Job:
             [
                 "Output rules:",
                 "- title: <= 28 chars, curiosity-driven, no clickbait lies.",
-                "- script: 5-7 sentences total. First sentence must be the hook.",
-                "- script: avoid long clauses; prefer short lines that are easy to subtitle.",
-                "- description: 1-2 sentences summary.",
+                "- script: 6-9 short lines/sentences. First sentence must be the hook, 2nd sentence should raise tension.",
+                "- script must contain: 1) 한 가지 구체적 장면 or 사례, 2) 바로 적용 가능한 한 줄 팁, 3) 마지막 1줄 CTA.",
+                "- Avoid long clauses and abstract statements. Each sentence should be easy to read in subtitles.",
+                "- description: 1-2 clear sentences.",
                 "- hashtags: 3-5 tags including #shorts.",
                 "- pexels_query: 4-8 English words, no brand names.",
-                "Structure:",
-                "1) Hook",
-                "2) 3-5 beats (each beat 1 sentence)",
-                "3) Wrap-up + subtle CTA (e.g., '???뚭퀬 ?띠쑝硫????)",
+                "Quality requirements:",
+                "- first line: hook question/반전/도전식 문장.",
+                "- middle: at least 1 vivid example (예: '예를 들어', '실제로').",
+                "- ending: one direct CTA (좋아요/구독/댓글/좋은 영상 확인 유도).",
+                "- no markdown, no list wrappers, output plain JSON only.",
             ]
         )
     )
@@ -965,9 +978,37 @@ def openai_generate_job(config: dict, job: Job) -> Job:
             "description": {"type": "string"},
             "hashtags": {"type": "string"},
             "pexels_query": {"type": "string"},
+            "hook": {"type": "string"},
+            "quality_check": {"type": "string"},
         },
         "required": ["title", "script", "description", "hashtags", "pexels_query"],
     }
+
+    def _is_quality_script(text: str) -> bool:
+        if not text:
+            return False
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            lines = [ln.strip() for ln in re.split(r"[.!?]\s*", text) if ln.strip()]
+        if not (6 <= len(lines) <= 12):
+            return False
+        first = lines[0]
+        first_hook = bool(re.search(r"[?]|왜|어떻게|혹시|상상|진짜|한번|한 번|만약", first))
+        if not first_hook:
+            return False
+        has_example = any(
+            k in text for k in ("예를 들어", "예시", "실제로", "상황에서", "현장에서", "한 번만")
+        )
+        if not has_example:
+            return False
+        has_cta = any(
+            k in text for k in ("좋아요", "구독", "댓글", "확인", "알려", "알아보", "다음 영상", "채널")
+        )
+        if not has_cta:
+            return False
+        if any(k in text for k in ("중요한 것은", "많은 사람들이", "결국", "일반적으로", "보통", "언제나")):
+            return False
+        return True
 
     payload = {
         "model": model,
@@ -988,27 +1029,36 @@ def openai_generate_job(config: dict, job: Job) -> Job:
         "store": False,
     }
 
-    r = requests.post(
-        f"{base_url}/responses",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=timeout_s,
-    )
-    r.raise_for_status()
-    data = r.json()
+    script_attempts = 2
+    obj = {}
+    for _ in range(script_attempts):
+        r = requests.post(
+            f"{base_url}/responses",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=timeout_s,
+        )
+        r.raise_for_status()
+        data = r.json()
 
-    text_out = None
-    for item in data.get("output", []) or []:
-        for c in item.get("content", []) or []:
-            if c.get("type") in ("output_text", "text") and isinstance(c.get("text"), str):
-                text_out = c["text"]
+        text_out = None
+        for item in data.get("output", []) or []:
+            for c in item.get("content", []) or []:
+                if c.get("type") in ("output_text", "text") and isinstance(c.get("text"), str):
+                    text_out = c["text"]
+                    break
+            if text_out:
                 break
-        if text_out:
-            break
-    if not text_out:
-        raise RuntimeError("OpenAI ?묐떟?먯꽌 ?띿뒪?몃? 李얠? 紐삵뻽?듬땲??")
+        if not text_out:
+            raise RuntimeError("OpenAI response did not include expected output text.")
 
-    obj = json.loads(text_out)
+        obj = json.loads(text_out)
+        script = (obj.get("script") or "").strip()
+        if _is_quality_script(script):
+            break
+        print("[-] Generated script failed quality check; regenerating once.")
+        continue
+
     title = (obj.get("title") or "").strip()
     script = (obj.get("script") or "").strip()
     description = (obj.get("description") or "").strip()
@@ -1336,8 +1386,8 @@ def ensure_background_for_job(config: dict, job: Job, *, duration_s: float, out_
     api_key = (config.get("pexels_api_key") or os.environ.get("PEXELS_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError(
-            "background_provider=pexels ?몃뜲 Pexels API key媛 ?놁뒿?덈떎. "
-            "?섍꼍蹂??`PEXELS_API_KEY`瑜??ㅼ젙?섏꽭?? (?먮뒗 config??`pexels_api_key`)"
+            "background_provider=pexels requires Pexels API key. "
+            "Set env PEXELS_API_KEY (or config pexels_api_key)."
         )
 
     query = (config.get("pexels_query") or "").strip() or guess_pexels_query(job)
@@ -1608,6 +1658,41 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
         key="subtitle_outline",
         min_value=0,
     )
+    subs_shadow_px = _coerce_int(
+        config.get("subtitle_shadow"),
+        default=3,
+        key="subtitle_shadow",
+        min_value=0,
+        max_value=10,
+    )
+    def _coerce_ass_color(value: str | Any | None, default: str) -> str:
+        if not isinstance(value, str):
+            return default
+        raw = value.strip().upper().replace(" ", "")
+        if not raw:
+            return default
+        if not raw.startswith("&H"):
+            raw = "&H" + raw
+        if re.fullmatch(r"&H[0-9A-F]{8}", raw):
+            return raw
+        return default
+
+    subs_primary_colour = _coerce_ass_color(
+        config.get("subtitle_primary_color"),
+        default="&H00FFFFFF",
+    )
+    subs_secondary_colour = _coerce_ass_color(
+        config.get("subtitle_secondary_color"),
+        default="&H00FFFFFF",
+    )
+    subs_outline_colour = _coerce_ass_color(
+        config.get("subtitle_outline_color"),
+        default="&H00000000",
+    )
+    subs_back_colour = _coerce_ass_color(
+        config.get("subtitle_back_color"),
+        default="&H00000000",
+    )
 
     # Keep legacy default for legacy top/bottom-style setups.
     # For center/middle, explicit subtitle_margin_v / subtitle_vshift are handled separately.
@@ -1654,11 +1739,12 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
         else:
             subs_margin_px = 0
 
-    print(
-        f"[subtitles] position={subtitle_position} align={subtitle_alignment} "
-        f"font={subs_font_name} fontfile={subtitle_fontfile or 'default'} "
-        f"font_size={subs_fontsize_px} outline={subs_outline_px} margin_v={subs_margin_px}"
-    )
+        print(
+            f"[subtitles] position={subtitle_position} align={subtitle_alignment} "
+            f"font={subs_font_name} fontfile={subtitle_fontfile or 'default'} "
+            f"font_size={subs_fontsize_px} outline={subs_outline_px} shadow={subs_shadow_px} "
+            f"margin_v={subs_margin_px} outline_color={subs_outline_colour} back_color={subs_back_colour}"
+        )
 
     margin_min = -300 if vertical_sub_pos == "middle" else 0
     ass_margin_v = px_to_ass(subs_margin_px, min_v=margin_min)
@@ -1671,8 +1757,13 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
             font_name=subs_font_name,
             font_size=px_to_ass(subs_fontsize_px),
             outline=px_to_ass(subs_outline_px),
+            shadow=px_to_ass(subs_shadow_px),
             alignment=subtitle_alignment,
             margin_v=ass_margin_v,
+            primary_colour=subs_primary_colour,
+            secondary_colour=subs_secondary_colour,
+            outline_colour=subs_outline_colour,
+            back_colour=subs_back_colour,
         )
     except Exception as e:
         raise RuntimeError(f"subtitle ASS conversion failed: {_one_line(str(e))}") from e
@@ -1973,7 +2064,7 @@ def ensure_job_ready(config: dict, job: Job, *, allow_llm: bool) -> Job:
     )
     job2 = openai_generate_job(config, seed_job)
     if not (job2.title and job2.script):
-        raise RuntimeError("OpenAI ?앹꽦 寃곌낵媛 鍮꾩뼱?덉뒿?덈떎(title/script).")
+        raise RuntimeError("OpenAI generation failed to return title/script.")
     return job2
 
 
@@ -2369,9 +2460,9 @@ def main() -> int:
         if external_audio:
             if not audio.exists():
                 raise FileNotFoundError(f"--audio not found: {audio}")
-            print("[1/3] TTS ?ㅽ궢 (--audio)")
+            print("[1/3] TTS skipped (--audio)")
         else:
-            print("[1/4] TTS ?앹꽦")
+            print("[1/4] TTS generate")
             tts_provider = (config.get("tts_provider") or "elevenlabs").lower()
             if tts_provider != "elevenlabs":
                 print(f"[-] tts_provider={tts_provider!r} is not supported. Forcing ElevenLabs-only mode.")
@@ -2425,7 +2516,7 @@ def main() -> int:
             except Exception as e:
                 raise RuntimeError(f"TTS failed after {tts_attempts} attempts: {_one_line(str(e))}") from e
 
-        print("[2/3] ?먮쭑 ?앹꽦" if external_audio else "[2/4] ?먮쭑 ?앹꽦")
+        print("[2/3] Subtitle generation" if external_audio else "[2/4] Subtitle generation")
         duration = probe_duration(audio, ffprobe=resolve_bin(config, "ffprobe_bin", "ffprobe"))
         subtitle_sync_tolerance = _coerce_float(
             config.get("subtitle_sync_drift_tolerance"),
@@ -2456,7 +2547,7 @@ def main() -> int:
         # 1) OpenAI alignment (best sync)
         if (not external_audio) and bool(config.get("subtitle_align_openai", True)):
             try:
-                print("[2-1/4] OpenAI ?먮쭑 ?뺣젹 ?쒕룄")
+                print("[2-1/4] OpenAI subtitle alignment (attempt)")
                 write_srt_aligned_openai(
                     config,
                     audio_path=audio,
@@ -2477,16 +2568,16 @@ def main() -> int:
                     subtitle_method = "openai"
                 else:
                     print(
-                        f"[-] OpenAI ?먮쭑???ㅻ뵒??湲몄씠? ?숆린?붾릺吏 ?딆븯?듬땲?? "
-                        f"(?덉슜 ?ㅼ감 {subtitle_sync_tolerance:.2f}s). fallback 吏꾪뻾"
+                        f"[-] OpenAI subtitle sync not within tolerance (tolerance {subtitle_sync_tolerance:.2f}s). "
+                        f"fallback will be used."
                     )
             except Exception as e:
-                print(f"[-] OpenAI ?먮쭑 ?뺣젹 ?ㅽ뙣: {e}")
+                print(f"[-] OpenAI subtitle alignment failed: {e}")
 
         # 2) Final fallback: script split aligned only by script duration.
         if not subtitle_ok:
             try:
-                print("[2-2/4] ?ㅽ겕由쏀듃 湲곕컲 ?먮쭑 遺꾪븷 fallback")
+                print("[2-2/4] Script-based subtitle fallback")
                 max_chars = _coerce_int(config.get("subtitle_max_chars"), default=26, key="subtitle_max_chars", min_value=4)
                 lines = split_for_captions_dense(job.script or "", max_chars=max_chars) or split_for_captions(job.script or "")
                 write_srt(lines, duration, srt)
@@ -2516,15 +2607,15 @@ def main() -> int:
         generated_artifacts.append(video.with_suffix(".title.txt"))
         generated_artifacts.append(video.with_suffix(".subs.ass"))
 
-        print(f"?뚮뜑 ?꾨즺: {video}")
+        print(f"output video: {video}")
         if credit_line:
             credit_path = out_dir / f"{stamp}.credits.txt"
             credit_path.write_text(credit_line + "\n", encoding="utf-8")
-            print(f"?щ젅?? {credit_path}")
+            print(f"credits: {credit_path}")
             generated_artifacts.append(credit_path)
 
         if no_upload:
-            print("?낅줈???ㅽ궢 (--no-upload ?먮뒗 NO_UPLOAD=1)")
+            print("upload skipped (--no-upload or NO_UPLOAD=1)")
         else:
             yt_cfg = dict(config.get("youtube") or {})
             idempotency_key = _job_idempotency_key(job_path)
@@ -2541,13 +2632,13 @@ def main() -> int:
                 upload_url = existing.get("upload_url") if isinstance(existing.get("upload_url"), str) else None
                 if not upload_url and video_id:
                     upload_url = f"https://youtu.be/{video_id}"
-                print(f"[4/4] ?좏뒠釉??낅줈???ㅽ궢 (?대? ?낅줈?쒕맖): {upload_url or (video_id or 'unknown')}")
+                print(f"[4/4] Already uploaded (stored output): {upload_url or (video_id or 'unknown')}")
             else:
                 print("[4/4] Uploading to YouTube...")
                 validate_upload_checklist(config, job, video)
                 video_id = upload_video(config, job, video, credit_line=credit_line)
                 upload_url = f"https://youtu.be/{video_id}"
-                print(f"?낅줈???꾨즺: {upload_url}")
+                print(f"uploaded: {upload_url}")
 
                 # Persist as soon as we have a video id so reruns won't duplicate-upload.
                 if bool(yt_cfg.get("idempotency_enabled", True)):
