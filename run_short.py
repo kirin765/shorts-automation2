@@ -162,7 +162,14 @@ def fmt_time(seconds: float) -> str:
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
 
-def _coerce_int(value, *, default: int, key: str | None = None, min_value: int = 0) -> int:
+def _coerce_int(
+    value,
+    *,
+    default: int,
+    key: str | None = None,
+    min_value: int = 0,
+    max_value: int | None = None,
+) -> int:
     try:
         n = int(value)
     except (TypeError, ValueError):
@@ -174,6 +181,11 @@ def _coerce_int(value, *, default: int, key: str | None = None, min_value: int =
         if key is not None:
             print(f"[-] Config '{key}'={n} is below minimum ({min_value}); using default {default}.")
         return default
+
+    if max_value is not None and n > max_value:
+        if key is not None:
+            print(f"[-] Config '{key}'={n} is above maximum ({max_value}); using max {max_value}.")
+        return max_value
 
     return n
 
@@ -978,8 +990,6 @@ def openai_generate_job(config: dict, job: Job) -> Job:
             "description": {"type": "string"},
             "hashtags": {"type": "string"},
             "pexels_query": {"type": "string"},
-            "hook": {"type": "string"},
-            "quality_check": {"type": "string"},
         },
         "required": ["title", "script", "description", "hashtags", "pexels_query"],
     }
@@ -1038,7 +1048,16 @@ def openai_generate_job(config: dict, job: Job) -> Job:
             json=payload,
             timeout=timeout_s,
         )
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except requests.RequestException:
+            try:
+                data = r.json()
+                detail = data.get("error", {})
+                msg = detail.get("message") or detail.get("code") or detail.get("type") or r.text
+            except Exception:
+                msg = r.text
+            raise RuntimeError(f"OpenAI responses request failed ({r.status_code}): {_one_line(str(msg))}")
         data = r.json()
 
         text_out = None
@@ -1582,6 +1601,12 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
     duration = probe_duration(audio, ffprobe=ffprobe)
     top_h = int(config.get("top_bar_height", 260))
     bottom_h = int(config.get("bottom_bar_height", 260))
+    title_y_offset = _coerce_int(
+        config.get("title_y_offset"),
+        default=0,
+        key="title_y_offset",
+        min_value=0,
+    )
 
     # Use a Korean-capable font for the title; otherwise `drawtext` renders squares.
     font_opt = ""
@@ -1775,7 +1800,7 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
 
     # Title y position inside top bar
     # Keep some breathing room under the top bar for 1-2 lines.
-    title_y = max(34, int(top_h * 0.16))
+    title_y = max(34, int(top_h * 0.16) + title_y_offset)
     ass_safe = _ffmpeg_escape(str(ass_path))
 
     vf = (
