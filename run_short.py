@@ -588,6 +588,26 @@ def write_srt_aligned_openai(
     model = (config.get("openai_transcribe_model") or "whisper-1").strip()
     timeout_s = int(config.get("openai_transcribe_timeout_s", 60))
     transcribe_lang = _resolve_openai_language(config.get("openai_transcribe_language"))
+    if not transcribe_lang:
+        transcribe_lang = _resolve_openai_language(config.get("openai_script_language"))
+        if not transcribe_lang:
+            transcribe_lang = _resolve_openai_language(config.get("openai_language"))
+            if not transcribe_lang:
+                transcribe_lang = _resolve_openai_language(config.get("default_language"))
+    subtitle_auto_fallback_to_script = _coerce_bool(config.get("subtitle_auto_fallback_to_script"), default=True)
+    korean_min_ratio = _coerce_float(config.get("subtitle_korean_min_ratio"), default=0.45, key="subtitle_korean_min_ratio")
+    leading_gap_realign_max = _coerce_float(
+        config.get("subtitle_leading_gap_realign_max_s"),
+        default=1.2,
+        key="subtitle_leading_gap_realign_max_s",
+    )
+
+    if korean_min_ratio < 0.05 or korean_min_ratio > 1.0:
+        print("[-] subtitle_korean_min_ratio is out of [0.05,1.0]; using 0.45")
+        korean_min_ratio = 0.45
+    if leading_gap_realign_max < 0.0:
+        print("[-] subtitle_leading_gap_realign_max_s is negative; using 0")
+        leading_gap_realign_max = 0.0
 
     files = {"file": (audio_path.name, audio_path.read_bytes(), "audio/mpeg")}
     data = {
@@ -637,6 +657,49 @@ def write_srt_aligned_openai(
             return
         blocks.append(f"{i}\n{fmt_time(start)} --> {fmt_time(end)}\n{text.strip()}\n")
 
+    def _is_korean_expected() -> bool:
+        # For subtitle quality checks only; keep this broad so empty config still follows
+        # a reasonable fallback for Korean-first operation.
+        if transcribe_lang and isinstance(transcribe_lang, str):
+            return transcribe_lang.lower().startswith("ko")
+        return (_resolve_openai_language(config.get("openai_script_language")).lower() or "ko").startswith("ko")
+
+    def _line_is_suspicious(text: str) -> bool:
+        if not text.strip():
+            return False
+        if _is_korean_expected():
+            # Purely English long lines are usually drift/garbage for Korean narration.
+            if not re.search(r"[가-힣]", text):
+                return len(re.findall(r"[A-Za-z]{3,}", text)) >= 4
+            return False
+        return False
+
+    def _looks_language_bad(lines: list[str]) -> bool:
+        if not lines:
+            return True
+        if not _is_korean_expected():
+            return False
+
+        nonempty = [l for l in lines if l.strip()]
+        if not nonempty:
+            return True
+
+        joined = "".join(nonempty)
+        supported = re.findall(r"[가-힣A-Za-z]", joined)
+        if not supported:
+            return True
+        korean_chars = len(re.findall(r"[가-힣]", joined))
+        ratio = korean_chars / max(1, len(supported))
+        if ratio < korean_min_ratio:
+            return True
+        suspicious = [l for l in nonempty if _line_is_suspicious(l)]
+        if len(suspicious) >= 2:
+            return True
+        if any(len(re.findall(r"[A-Za-z]{6,}", l)) >= 8 and not re.search(r"[가-힣]", l) for l in nonempty):
+            return True
+
+        return False
+
     words = obj.get("words") or []
     if isinstance(words, list) and words:
         cue_words: list[dict] = []
@@ -677,8 +740,8 @@ def write_srt_aligned_openai(
                 continue
             start = float(seg.get("start") or 0.0)
             end = float(seg.get("end") or start)
-            parts = textwrap.wrap(text, width=max_chars, break_long_words=False) or [text]
-            if len(parts) == 1:
+                parts = textwrap.wrap(text, width=max_chars, break_long_words=False) or [text]
+                if len(parts) == 1:
                 add_window(start, end)
                 transcript_lines.append(parts[0].strip())
                 continue
@@ -719,6 +782,49 @@ def write_srt_aligned_openai(
                 s, e = out[-1]
                 out.append((e, e + min_cue))
             return out
+
+        # Keep first subtitle near zero if model reports short initial delay.
+        if windows and leading_gap_realign_max > 0.0:
+            first_start = windows[0][0]
+            if 0.0 < first_start <= leading_gap_realign_max:
+                shift = first_start
+                print(f"[i] Subtitle lead gap correction applied: shift={shift:.2f}s")
+                windows[:] = [(max(0.0, s - shift), max(shift + 1e-3, e - shift)) for (s, e) in windows]
+
+        # Match the number of timing windows to the desired number of script lines.
+        win = resample_windows(windows, len(lines))
+
+        for i, ((start, end), text) in enumerate(zip(win, lines), start=1):
+            add_block(i, start, end, text)
+        srt_path.write_text("\n".join(blocks), encoding="utf-8")
+        return
+
+    # Default: use transcript text, with language drift fallback to script when needed.
+    if text_source == "auto":
+        text_source = "transcript"
+
+    if text_source == "transcript":
+        if subtitle_auto_fallback_to_script and _looks_language_bad(transcript_lines) and script_text.strip():
+            print("[-] Transcript appears unstable/foreign-dominant for expected language. Falling back to script subtitles.")
+            text_source = "script"
+        elif _looks_language_bad(transcript_lines) and not script_text.strip():
+            print("[-] Transcript appears unstable but no script available; keeping transcript with best-effort split.")
+
+    if text_source == "script":
+        # Use original script for on-screen text, but keep Whisper timing windows.
+        lines = split_for_captions_dense(script_text or "", max_chars=max_chars) or split_for_captions(script_text or "")
+        if not windows:
+            raise RuntimeError("no timing windows produced")
+        if not lines:
+            raise RuntimeError("script is empty for subtitle fallback")
+
+        # Keep first subtitle near zero if script fallback path is selected and model reported lag.
+        if windows and leading_gap_realign_max > 0.0:
+            first_start = windows[0][0]
+            if 0.0 < first_start <= leading_gap_realign_max:
+                shift = first_start
+                print(f"[i] Subtitle lead gap correction applied: shift={shift:.2f}s")
+                windows[:] = [(max(0.0, s - shift), max(shift + 1e-3, e - shift)) for (s, e) in windows]
 
         # Match the number of timing windows to the desired number of script lines.
         win = resample_windows(windows, len(lines))
@@ -945,6 +1051,27 @@ def openai_generate_job(config: dict, job: Job) -> Job:
         "Avoid boilerplate clichés such as '중요한 것은', '많은 사람들이', '많은 분들이', "
         "'결국', '결국 중요한 건', and other generic motivational lines."
     )
+    mobile_topic = any(
+        k in f"{topic} {subtopic}".lower()
+        for k in (
+            "스마트폰",
+            "휴대폰",
+            "모바일",
+            "폰",
+            "ios",
+            "android",
+            "아이폰",
+            "갤럭시",
+            "안드로이드",
+            "화면 잠금",
+            "배터리",
+        )
+    )
+    if mobile_topic:
+        system += (
+            " For smartphone/mobile topics, each tip must explicitly label OS applicability "
+            "(안드로이드 전용 / iOS 전용 / 양쪽 공통) and mention version/device constraints where needed."
+        )
     user_parts = [
         f"Topic: {topic}",
     ]
@@ -980,6 +1107,13 @@ def openai_generate_job(config: dict, job: Job) -> Job:
             ]
         )
     )
+    if mobile_topic:
+        user += (
+            "\n"
+            "For smartphone/mobile content, output script in numbered short tips (ex: 1),2),3)) where each tip explicitly states "
+            "OS applicability (안드로이드 전용, iOS 전용, 또는 양쪽 공통) and adds practical caveats "
+            "(예: '안드로이드 12+ 전용', 'iOS 16+', '양쪽 공통')."
+        )
 
     schema = {
         "type": "object",
@@ -1011,6 +1145,14 @@ def openai_generate_job(config: dict, job: Job) -> Job:
         )
         if not has_example:
             return False
+        if mobile_topic:
+            os_markers = ("안드로이드", "아이폰", "iOS", "iOS", "안드로이드", "안드로이드 전용", "iOS 전용", "양쪽", "공통", "둘 다", "공유")
+            if not any(marker in text for marker in os_markers):
+                return False
+            tip_lines = [ln for ln in lines if re.match(r"^\s*\d+[\)\.]\s*", ln)]
+            if len(tip_lines) >= 2:
+                if not all(any(marker in ln for marker in os_markers) for ln in tip_lines):
+                    return False
         has_cta = any(
             k in text for k in ("좋아요", "구독", "댓글", "확인", "알려", "알아보", "다음 영상", "채널")
         )
@@ -1966,6 +2108,61 @@ def _retry_upload_next_chunk(
             backoff_s = min(backoff_s * 2.0, float(max_backoff_s))
 
 
+def _retry_action(
+    *,
+    action_name: str,
+    action_fn: Callable[[], Any],
+    max_attempts: int,
+    timeout_s: float | None,
+    initial_backoff_s: float,
+    max_backoff_s: float,
+    is_retryable_exc: Callable[[BaseException], bool],
+    sleep_fn: Callable[[float], None] = time.sleep,
+    time_fn: Callable[[], float] = time.monotonic,
+    log_fn: Callable[[str], None] = print,
+) -> Any:
+    max_attempts = int(max_attempts)
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
+
+    started = time_fn()
+    attempt = 0
+    backoff_s = float(initial_backoff_s)
+    timeout_s = float(timeout_s) if timeout_s is not None else None
+
+    log_fn(
+        "[upload] policy "
+        f"platform={action_name} "
+        f"max_attempts={max_attempts} "
+        f"timeout_s={(timeout_s if timeout_s is not None else 'none')} "
+        f"initial_backoff_s={float(initial_backoff_s)} "
+        f"max_backoff_s={float(max_backoff_s)}"
+    )
+
+    while True:
+        if timeout_s is not None and (time_fn() - started) > timeout_s:
+            raise TimeoutError(f"upload timed out after {timeout_s:.1f}s")
+
+        attempt += 1
+        try:
+            return action_fn()
+        except Exception as e:
+            if (attempt >= max_attempts) or (not is_retryable_exc(e)):
+                raise
+
+            if timeout_s is not None:
+                elapsed = time_fn() - started
+                if elapsed + backoff_s > timeout_s:
+                    raise TimeoutError(f"upload timed out after {timeout_s:.1f}s") from e
+
+            log_fn(
+                f"[upload] {action_name} failed (attempt {attempt}/{max_attempts}): {type(e).__name__}: {_one_line(str(e))}"
+            )
+            log_fn(f"[upload] retrying in {backoff_s:.1f}s")
+            sleep_fn(backoff_s)
+            backoff_s = min(backoff_s * 2.0, float(max_backoff_s))
+
+
 def upload_video(config: dict, job: Job, video_path: Path, *, credit_line: str | None = None):
     # Lazy import so `--no-upload` can run without Google deps installed.
     from googleapiclient.http import MediaFileUpload
@@ -2030,6 +2227,205 @@ def upload_video(config: dict, job: Job, video_path: Path, *, credit_line: str |
     )
 
     return response.get("id")
+
+
+def _normalize_upload_targets(config: dict) -> list[str]:
+    raw = config.get("upload_targets", ["youtube"])
+    if raw is None:
+        return ["youtube"]
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        print("[-] upload_targets should be a list; using ['youtube'].")
+        return ["youtube"]
+
+    out: list[str] = []
+    for item in raw:
+        name = str(item).strip().lower()
+        if not name:
+            continue
+        if name in {"yt", "youtube"}:
+            name = "youtube"
+        elif name in {"tt", "tik", "tiktok", "tik_tok"}:
+            name = "tiktok"
+        elif name not in {"youtube", "tiktok"}:
+            print(f"[-] Unsupported upload target '{name}'; skipping.")
+            continue
+        if name not in out:
+            out.append(name)
+
+    if not out:
+        return ["youtube"]
+    return out
+
+
+def _upload_results_from_record(record: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    if not isinstance(record, dict):
+        return {}
+
+    out: dict[str, dict[str, Any]] = {}
+    raw_results = record.get("results")
+    if isinstance(raw_results, dict):
+        for platform, entry in raw_results.items():
+            if not isinstance(entry, dict):
+                continue
+            normalized = {k: v for k, v in entry.items() if isinstance(k, str)}
+            if "upload_url" in normalized or "video_id" in normalized:
+                out[str(platform)] = normalized
+
+    if "youtube" not in out and (
+        isinstance(record.get("video_id"), str) or isinstance(record.get("upload_url"), str)
+    ):
+        out["youtube"] = {
+            k: record.get(k)
+            for k in ("video_id", "upload_url")
+            if isinstance(record.get(k), str)
+        }
+    return out
+
+
+def _extract_upload_url(raw_output: str) -> str:
+    text = (raw_output or "").strip()
+    if not text:
+        raise RuntimeError("command output is empty")
+
+    # JSON format support: {"url": "..."}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                for key in ("upload_url", "url", "link", "video_url"):
+                    val = obj.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+        except Exception:
+            continue
+
+    match = re.search(r"https?://[^\s\"'<>()\[\]{}|`]*", text)
+    if not match:
+        raise RuntimeError("upload URL not found in command output")
+
+    url = match.group(0).rstrip(")]},.;:\t\n\r ")
+    if not url:
+        raise RuntimeError("upload URL not found in command output")
+    return url
+
+
+def _upload_tiktok(config: dict, job: Job, video_path: Path, *, credit_line: str | None = None) -> str:
+    # Lazy import not needed; subprocess already available.
+    tk_cfg = config.get("tiktok")
+    if not isinstance(tk_cfg, dict):
+        raise RuntimeError("TikTok upload config section missing")
+
+    if not bool(tk_cfg.get("enabled", False)):
+        raise RuntimeError("TikTok upload target is disabled")
+
+    state_path = str((tk_cfg.get("state_path") or "secrets/tiktok_state.json")).strip()
+    upload_command = (tk_cfg.get("upload_command") or "").strip()
+    if not upload_command:
+        raise RuntimeError("TikTok upload_command is empty")
+
+    description = f"{job.description or ''}\n\n{job.hashtags or ''}".strip()
+    if credit_line and bool(config.get("append_credit_to_description", True)):
+        description = f"{description}\n\n{credit_line}".strip()
+
+    vars_for_cmd = {
+        "video": shlex.quote(str(video_path)),
+        "video_path": shlex.quote(str(video_path)),
+        "title": shlex.quote((job.title or "").strip()),
+        "description": shlex.quote(description),
+        "hashtags": shlex.quote(job.hashtags or ""),
+        "credit_line": shlex.quote(credit_line or ""),
+        "state_path": shlex.quote(state_path),
+    }
+
+    tiktok_headless = _coerce_bool(tk_cfg.get("headless"), default=True)
+    vars_for_cmd["headless"] = "true" if tiktok_headless else "false"
+
+    timeout_s = _coerce_float(
+        tk_cfg.get("upload_timeout_s"),
+        default=600.0,
+        key="upload_timeout_s",
+    )
+
+    vars_for_cmd["upload_timeout_s"] = shlex.quote(str(int(timeout_s)))
+
+    try:
+        rendered_cmd = upload_command.format(**vars_for_cmd)
+    except KeyError as e:
+        raise RuntimeError(f"TikTok upload command missing placeholder: {e}")
+
+    try:
+        cmd = shlex.split(rendered_cmd)
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse TikTok upload command: {_one_line(str(e))}") from e
+    if not cmd:
+        raise RuntimeError("TikTok upload command is empty after formatting")
+
+    max_attempts = _coerce_int(
+        tk_cfg.get("upload_max_attempts"),
+        default=3,
+        key="upload_max_attempts",
+        min_value=1,
+    )
+    initial_backoff_s = _coerce_float(
+        tk_cfg.get("upload_initial_backoff_s"),
+        default=2.0,
+        key="upload_initial_backoff_s",
+    )
+    max_backoff_s = _coerce_float(
+        tk_cfg.get("upload_max_backoff_s"),
+        default=30.0,
+        key="upload_max_backoff_s",
+    )
+
+    def _do_upload() -> str:
+        p = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=float(timeout_s) if timeout_s is not None else None,
+        )
+        if p.returncode != 0:
+            stderr = _one_line(p.stderr or p.stdout or "")
+            raise RuntimeError(f"TikTok uploader returned non-zero ({p.returncode}): {stderr}")
+        output = (p.stdout or "").strip()
+        return _extract_upload_url(output)
+
+    return _retry_action(
+        action_name="tiktok",
+        action_fn=_do_upload,
+        max_attempts=max_attempts,
+        timeout_s=(float(timeout_s) if timeout_s is not None else None),
+        initial_backoff_s=initial_backoff_s,
+        max_backoff_s=max_backoff_s,
+        is_retryable_exc=lambda e: isinstance(e, (TimeoutError, OSError, subprocess.TimeoutExpired)),
+    )
+
+
+def upload_to_platform(
+    config: dict,
+    platform: str,
+    job: Job,
+    video_path: Path,
+    *,
+    credit_line: str | None = None,
+) -> dict[str, str | None]:
+    if platform == "youtube":
+        video_id = upload_video(config, job, video_path, credit_line=credit_line)
+        upload_url = f"https://youtu.be/{video_id}"
+        return {"platform": platform, "video_id": video_id, "upload_url": upload_url}
+    if platform == "tiktok":
+        url = _upload_tiktok(config, job, video_path, credit_line=credit_line)
+        parsed_video_id = None
+        m = re.search(r"video/(\d+)", url) or re.search(r"video/(\d+)", _one_line(url))
+        if m:
+            parsed_video_id = m.group(1)
+        return {"platform": platform, "video_id": parsed_video_id, "upload_url": url}
+    raise RuntimeError(f"Unsupported upload platform '{platform}'")
 
 
 def load_job(path: Path) -> Job:
@@ -2140,6 +2536,10 @@ def _lookup_uploaded_record(state_path: Path, job_key: str) -> dict[str, Any] | 
     rec = _read_jsonl_last_by_key(state_path, key_field="job_key").get(job_key)
     if not rec:
         return None
+
+    if _upload_results_from_record(rec):
+        return rec
+
     if rec.get("video_id") or rec.get("upload_url"):
         return rec
     return None
@@ -2384,6 +2784,8 @@ def format_result_line(
     upload_url: str | None,
     no_upload: bool,
     error: str | None = None,
+    upload_results: dict[str, dict[str, str | None]] | None = None,
+    upload_failures: dict[str, str] | None = None,
 ) -> str:
     parts: list[str] = [
         "RESULT",
@@ -2398,6 +2800,17 @@ def format_result_line(
         parts.append("upload=SKIPPED")
     elif upload_url:
         parts.append(f"upload={upload_url}")
+    if upload_results:
+        parts.append(f"uploads={json.dumps(upload_results, ensure_ascii=False, separators=(",", ":"))}")
+    if upload_failures:
+        parts.append(
+            "upload_failures="
+            + json.dumps(
+                {k: _one_line(v) for k, v in upload_failures.items()},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
     if error:
         parts.append(f"error={_one_line(error)}")
     return " ".join(parts)
@@ -2442,6 +2855,9 @@ def main() -> int:
     duration: float | None = None
     video_id: str | None = None
     upload_url: str | None = None
+    upload_results: dict[str, dict[str, str | None]] = {}
+    upload_failures: dict[str, str] = {}
+    upload_targets: list[str] = []
     idempotency_hit: bool = False
     idempotency_key: str | None = None
     idempotency_state_file: str | None = None
@@ -2643,40 +3059,108 @@ def main() -> int:
             print("upload skipped (--no-upload or NO_UPLOAD=1)")
         else:
             yt_cfg = dict(config.get("youtube") or {})
+            upload_targets = _normalize_upload_targets(config)
+            if not upload_targets:
+                upload_targets = ["youtube"]
+
             idempotency_key = _job_idempotency_key(job_path)
             idempotency_state_file = str(yt_cfg.get("upload_state_file", "logs/uploads.jsonl"))
             state_path = Path(idempotency_state_file)
+            idempotency_enabled = bool(yt_cfg.get("idempotency_enabled", True))
 
             existing = None
-            if (not bool(args.force_upload)) and bool(yt_cfg.get("idempotency_enabled", True)):
+            existing_results: dict[str, dict[str, Any]] = {}
+            if (not bool(args.force_upload)) and idempotency_enabled:
                 existing = _lookup_uploaded_record(state_path, idempotency_key)
+                if existing:
+                    existing_results = _upload_results_from_record(existing)
 
-            if existing:
-                idempotency_hit = True
-                video_id = existing.get("video_id") if isinstance(existing.get("video_id"), str) else None
-                upload_url = existing.get("upload_url") if isinstance(existing.get("upload_url"), str) else None
-                if not upload_url and video_id:
-                    upload_url = f"https://youtu.be/{video_id}"
-                print(f"[4/4] Already uploaded (stored output): {upload_url or (video_id or 'unknown')}")
-            else:
-                print("[4/4] Uploading to YouTube...")
-                validate_upload_checklist(config, job, video)
-                video_id = upload_video(config, job, video, credit_line=credit_line)
-                upload_url = f"https://youtu.be/{video_id}"
-                print(f"uploaded: {upload_url}")
+            checklist_done = False
+            for platform in upload_targets:
+                existing_entry = existing_results.get(platform) if (not bool(args.force_upload)) and idempotency_enabled else None
+                if existing_entry:
+                    idempotency_hit = True
+                    upload_results[platform] = {
+                        "video_id": existing_entry["video_id"]
+                        if isinstance(existing_entry.get("video_id"), str)
+                        else None,
+                        "upload_url": existing_entry["upload_url"]
+                        if isinstance(existing_entry.get("upload_url"), str)
+                        else None,
+                    }
+                    existing_marker = existing_entry.get("upload_url") or existing_entry.get("video_id")
+                    print(f"[4/4] Already uploaded on {platform}: {existing_marker}")
+                    continue
 
-                # Persist as soon as we have a video id so reruns won't duplicate-upload.
-                if bool(yt_cfg.get("idempotency_enabled", True)):
-                    _append_jsonl(
-                        state_path,
-                        {
-                            "ts": datetime.now().isoformat(timespec="seconds"),
-                            "job_key": idempotency_key,
-                            "job_path": str(job_path),
-                            "video_id": video_id,
-                            "upload_url": upload_url,
-                        },
+                if platform == "youtube" and not checklist_done:
+                    validate_upload_checklist(config, job, video)
+                    checklist_done = True
+
+                print(f"[4/4] Uploading to {platform}...")
+                try:
+                    result = upload_to_platform(
+                        config,
+                        platform,
+                        job,
+                        video,
+                        credit_line=credit_line,
                     )
+                    upload_results[platform] = {
+                        "video_id": result.get("video_id"),
+                        "upload_url": result.get("upload_url"),
+                    }
+                    marker = result.get("upload_url") or result.get("video_id")
+                    print(f"[4/4] uploaded to {platform}: {marker}")
+                except Exception as e:
+                    msg = _one_line(str(e))
+                    upload_failures[platform] = msg
+                    print(f"[4/4] upload failed on {platform}: {msg}")
+
+            if idempotency_enabled and upload_results:
+                state_payload: dict[str, Any] = {
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "job_key": idempotency_key,
+                    "job_path": str(job_path),
+                    "results": {},
+                }
+                for pform, result in upload_results.items():
+                    normalized: dict[str, str] = {}
+                    if isinstance(result.get("video_id"), str):
+                        normalized["video_id"] = result["video_id"]
+                    if isinstance(result.get("upload_url"), str):
+                        normalized["upload_url"] = result["upload_url"]
+                    if normalized:
+                        state_payload["results"][pform] = normalized
+
+                if state_payload["results"]:
+                    youtube_entry = state_payload["results"].get("youtube", {})
+                    if isinstance(youtube_entry.get("video_id"), str):
+                        state_payload["video_id"] = youtube_entry["video_id"]
+                    if isinstance(youtube_entry.get("upload_url"), str):
+                        state_payload["upload_url"] = youtube_entry["upload_url"]
+                    if upload_failures:
+                        state_payload["upload_failures"] = {
+                            k: _one_line(v) for k, v in upload_failures.items()
+                        }
+                    _append_jsonl(state_path, state_payload)
+
+            if upload_failures:
+                failures = ", ".join(sorted(upload_failures.keys()))
+                raise RuntimeError(f"Upload failed for: {failures}")
+
+            if upload_results.get("youtube"):
+                if isinstance(upload_results["youtube"].get("video_id"), str):
+                    video_id = upload_results["youtube"]["video_id"]
+                if isinstance(upload_results["youtube"].get("upload_url"), str):
+                    upload_url = upload_results["youtube"]["upload_url"]
+            elif upload_results:
+                first = next(iter(upload_results.values()))
+                if isinstance(first.get("video_id"), str):
+                    video_id = first.get("video_id")
+                if isinstance(first.get("upload_url"), str):
+                    upload_url = first.get("upload_url")
+            if not upload_url and video_id:
+                upload_url = f"https://youtu.be/{video_id}"
 
         _print_summary(
             {
@@ -2692,6 +3176,9 @@ def main() -> int:
                 "duration_s": round(float(duration), 3) if duration is not None else None,
                 "video_id": video_id,
                 "upload_url": upload_url,
+                "upload_results": upload_results,
+                "upload_failures": upload_failures,
+                "upload_targets": upload_targets if not no_upload else [],
                 "idempotency_hit": idempotency_hit,
                 "idempotency_key": idempotency_key,
                 "idempotency_state_file": idempotency_state_file,
@@ -2705,6 +3192,8 @@ def main() -> int:
                 video_id=video_id,
                 upload_url=upload_url,
                 no_upload=no_upload,
+                upload_results=upload_results,
+                upload_failures=upload_failures,
             ),
             flush=True,
         )
@@ -2725,6 +3214,9 @@ def main() -> int:
             "srt": str(srt) if srt else None,
             "credits": str(credit_path) if credit_path else None,
             "duration_s": round(float(duration), 3) if duration is not None else None,
+            "upload_results": upload_results,
+            "upload_failures": upload_failures,
+            "upload_targets": upload_targets if not no_upload else [],
             "error_type": type(e).__name__,
             "error": _one_line(str(e)),
             "idempotency_hit": idempotency_hit,
@@ -2744,6 +3236,8 @@ def main() -> int:
             video_id=video_id,
             upload_url=upload_url,
             no_upload=no_upload,
+            upload_results=upload_results,
+            upload_failures=upload_failures,
             error=error_summary,
         )
         log_payload = {
@@ -2756,6 +3250,9 @@ def main() -> int:
             "srt": str(srt) if srt else None,
             "credits": str(credit_path) if credit_path else None,
             "duration_s": round(float(duration), 3) if duration is not None else None,
+            "upload_results": upload_results,
+            "upload_failures": upload_failures,
+            "upload_targets": upload_targets if not no_upload else [],
             "error_type": type(e).__name__,
             "error": _one_line(str(e)),
             "error_summary": error_summary,

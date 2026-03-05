@@ -19,6 +19,8 @@
   "background_provider": "pexels",
   "append_credit_to_description": true,
 
+  "upload_targets": ["youtube", "tiktok"],
+
   "pexels_api_key": "",
   "pexels_query": "",
   "pexels_orientation": "portrait",
@@ -67,7 +69,7 @@
   "openai_script_language": "ko",
   "openai_transcribe_model": "whisper-1",
   "openai_transcribe_timeout_s": 60,
-  "openai_transcribe_language": "",
+  "openai_transcribe_language": "ko",
   "openclaw_notify_enabled": false,
   "openclaw_notify_cmd": "openclaw telegram send --text {message}",
   "openclaw_notify_timeout_s": 12,
@@ -81,6 +83,9 @@
 
   "subtitle_align_openai": true,
   "subtitle_text_source": "transcript",
+  "subtitle_auto_fallback_to_script": true,
+  "subtitle_korean_min_ratio": 0.45,
+  "subtitle_leading_gap_realign_max_s": 1.2,
   "subtitle_max_chars": 26,
   "subtitle_words_per_cue": 10,
   "subtitle_min_cue_s": 0.45,
@@ -98,6 +103,16 @@
     "upload_state_file": "logs/uploads.jsonl",
     "upload_max_attempts": 5,
     "upload_timeout_s": 900,
+    "upload_initial_backoff_s": 2,
+    "upload_max_backoff_s": 30
+  },
+  "tiktok": {
+    "enabled": true,
+    "state_path": "secrets/tiktok_state.json",
+    "headless": true,
+    "upload_command": "python3 scripts/upload_tiktok.py --video {video} --title {title} --description {description} --state-path {state_path} --headless {headless} --upload-timeout {upload_timeout_s}",
+    "upload_max_attempts": 3,
+    "upload_timeout_s": 600,
     "upload_initial_backoff_s": 2,
     "upload_max_backoff_s": 30
   }
