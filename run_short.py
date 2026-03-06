@@ -732,56 +732,58 @@ def write_srt_aligned_openai(
         if not isinstance(segs, list) or not segs:
             raise RuntimeError("transcription returned no segments/words")
 
-        for seg in segs:
-            if not isinstance(seg, dict):
-                continue
-            text = str(seg.get("text") or "").strip()
-            if not text:
-                continue
-            start = float(seg.get("start") or 0.0)
-            end = float(seg.get("end") or start)
-                parts = textwrap.wrap(text, width=max_chars, break_long_words=False) or [text]
-                if len(parts) == 1:
-                add_window(start, end)
-                transcript_lines.append(parts[0].strip())
-                continue
-            total = sum(max(1, len(p)) for p in parts)
-            cur = start
-            for p in parts:
-                share = (max(1, len(p)) / total) * max(0.01, end - start)
-                add_window(cur, cur + share)
-                transcript_lines.append(p.strip())
-                cur += share
+    for seg in segs:
+        if not isinstance(seg, dict):
+            continue
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(seg.get("start") or 0.0)
+        end = float(seg.get("end") or start)
+        parts = textwrap.wrap(text, width=max_chars, break_long_words=False) or [text]
+        if len(parts) == 1:
+            add_window(start, end)
+            transcript_lines.append(parts[0].strip())
+            continue
+        total = sum(max(1, len(p)) for p in parts)
+        cur = start
+        for p in parts:
+            share = (max(1, len(p)) / total) * max(0.01, end - start)
+            add_window(cur, cur + share)
+            transcript_lines.append(p.strip())
+            cur += share
 
     # Decide subtitle text source.
     text_source = (config.get("subtitle_text_source") or "transcript").strip().lower()
-    if text_source not in ("transcript", "script"):
+    if text_source not in ("transcript", "script", "auto"):
         text_source = "transcript"
 
-    if text_source == "script":
+    def resample_windows(src: list[tuple[float, float]], target_n: int) -> list[tuple[float, float]]:
+        if target_n <= len(src):
+            return src[:target_n]
+        out = list(src)
+        # Split the longest window until we have enough.
+        while len(out) < target_n:
+            idx = max(range(len(out)), key=lambda i: (out[i][1] - out[i][0]))
+            s, e = out[idx]
+            if e - s <= (min_cue * 2.05):
+                break
+            mid = (s + e) / 2.0
+            out[idx : idx + 1] = [(s, mid), (mid, e)]
+        # If still short, append tiny windows at end (rare; keeps code from crashing).
+        while len(out) < target_n:
+            s, e = out[-1]
+            out.append((e, e + min_cue))
+        return out
+
+    def emit_script_subtitles() -> None:
         # Use original script for on-screen text, but keep Whisper timing windows.
         # Split more aggressively for a "Shorts" pacing.
         lines = split_for_captions_dense(script_text or "", max_chars=max_chars) or split_for_captions(script_text or "")
         if not windows:
             raise RuntimeError("no timing windows produced")
-
-        def resample_windows(src: list[tuple[float, float]], target_n: int) -> list[tuple[float, float]]:
-            if target_n <= len(src):
-                return src[:target_n]
-            out = list(src)
-            # Split the longest window until we have enough.
-            while len(out) < target_n:
-                idx = max(range(len(out)), key=lambda i: (out[i][1] - out[i][0]))
-                s, e = out[idx]
-                if e - s <= (min_cue * 2.05):
-                    break
-                mid = (s + e) / 2.0
-                out[idx : idx + 1] = [(s, mid), (mid, e)]
-            # If still short, append tiny windows at end (rare; keeps code from crashing).
-            while len(out) < target_n:
-                s, e = out[-1]
-                out.append((e, e + min_cue))
-            return out
+        if not lines:
+            raise RuntimeError("script is empty for subtitle fallback")
 
         # Keep first subtitle near zero if model reports short initial delay.
         if windows and leading_gap_realign_max > 0.0:
@@ -793,7 +795,6 @@ def write_srt_aligned_openai(
 
         # Match the number of timing windows to the desired number of script lines.
         win = resample_windows(windows, len(lines))
-
         for i, ((start, end), text) in enumerate(zip(win, lines), start=1):
             add_block(i, start, end, text)
         srt_path.write_text("\n".join(blocks), encoding="utf-8")
@@ -811,27 +812,7 @@ def write_srt_aligned_openai(
             print("[-] Transcript appears unstable but no script available; keeping transcript with best-effort split.")
 
     if text_source == "script":
-        # Use original script for on-screen text, but keep Whisper timing windows.
-        lines = split_for_captions_dense(script_text or "", max_chars=max_chars) or split_for_captions(script_text or "")
-        if not windows:
-            raise RuntimeError("no timing windows produced")
-        if not lines:
-            raise RuntimeError("script is empty for subtitle fallback")
-
-        # Keep first subtitle near zero if script fallback path is selected and model reported lag.
-        if windows and leading_gap_realign_max > 0.0:
-            first_start = windows[0][0]
-            if 0.0 < first_start <= leading_gap_realign_max:
-                shift = first_start
-                print(f"[i] Subtitle lead gap correction applied: shift={shift:.2f}s")
-                windows[:] = [(max(0.0, s - shift), max(shift + 1e-3, e - shift)) for (s, e) in windows]
-
-        # Match the number of timing windows to the desired number of script lines.
-        win = resample_windows(windows, len(lines))
-
-        for i, ((start, end), text) in enumerate(zip(win, lines), start=1):
-            add_block(i, start, end, text)
-        srt_path.write_text("\n".join(blocks), encoding="utf-8")
+        emit_script_subtitles()
         return
 
     # Default: use transcript text.
