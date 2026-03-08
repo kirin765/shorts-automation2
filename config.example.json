@@ -35,6 +35,7 @@
 
   "top_bar_height": 260,
   "bottom_bar_height": 260,
+  "title_y_offset": 26,
   "font_file": "",
   "subtitle_fontsdir": "",
   "subtitle_playres_y": 288,
@@ -50,6 +51,7 @@
   "subtitle_sync_repair": true,
   "subtitle_sync_repair_max_drift": 0.5,
   "subtitle_sync_max_scale_delta": 0.12,
+  "subtitle_max_first_start_s": 1.2,
 
   "video_preset": "medium",
   "video_crf": 21,
@@ -76,6 +78,8 @@
   "openclaw_notify_on_failure": true,
   "openclaw_notify_tail_lines": 20,
   "openclaw_error_log_path": "logs/errors.jsonl",
+  "google_api_key": "",
+  "youtube_api_key": "",
   "trend_sources": ["google", "youtube"],
   "trend_region": "KR",
   "trend_seed_count": 8,

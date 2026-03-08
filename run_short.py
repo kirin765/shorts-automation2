@@ -512,11 +512,32 @@ def _repair_srt_timing(
     return True
 
 
-def _validate_srt_timing(path: Path, audio_duration: float, *, max_drift: float = 0.5) -> bool:
+def _validate_srt_timing(
+    path: Path,
+    audio_duration: float,
+    *,
+    max_drift: float = 0.5,
+    max_first_start_s: float | None = None,
+    label: str = "srt",
+) -> bool:
     try:
-        last_end = _read_last_srt_end_time(path)
+        entries = _read_srt_timing_lines(path)
     except Exception as e:
         print(f"[-] Invalid subtitle timing ({e}); file={path}")
+        return False
+
+    if not entries:
+        print(f"[-] Invalid subtitle timing: no usable cues found (file={path})")
+        return False
+
+    first_start = entries[0][1]
+    last_end = entries[-1][2]
+
+    if max_first_start_s is not None and max_first_start_s >= 0 and first_start > max_first_start_s:
+        print(
+            f"[-] Subtitle timing invalid: first cue starts too late ({first_start:.2f}s > "
+            f"{max_first_start_s:.2f}s) for {label} (file={path})"
+        )
         return False
 
     if last_end <= 0:
@@ -539,6 +560,7 @@ def _apply_srt_timing_guard(
     repair_max_drift: float,
     max_scale_delta: float,
     validate_max_drift: float,
+    validate_max_first_start_s: float | None = None,
     label: str,
 ) -> bool:
     if enabled:
@@ -552,7 +574,13 @@ def _apply_srt_timing_guard(
             print(f"[-] {label} subtitle repair failed; moving to fallback.")
             return False
 
-    return _validate_srt_timing(path, audio_duration, max_drift=validate_max_drift)
+    return _validate_srt_timing(
+        path,
+        audio_duration,
+        max_drift=validate_max_drift,
+        max_first_start_s=validate_max_first_start_s,
+        label=label,
+    )
 
 
 def write_srt(lines: list[str], duration: float, srt_path: Path) -> None:
@@ -701,6 +729,7 @@ def write_srt_aligned_openai(
         return False
 
     words = obj.get("words") or []
+    segs: list[dict[str, Any]] = []
     if isinstance(words, list) and words:
         cue_words: list[dict] = []
         cue_text = ""
@@ -726,7 +755,8 @@ def write_srt_aligned_openai(
             end = float(cue_words[-1].get("end") or start)
             add_window(start, end)
             transcript_lines.append(cue_text.strip())
-    else:
+    # Segment-level fallback (used when word timestamps are missing).
+    if not windows:
         # Segment-level fallback.
         segs = obj.get("segments") or []
         if not isinstance(segs, list) or not segs:
@@ -1922,8 +1952,8 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
     )
 
     # Title y position inside top bar
-    # Keep some breathing room under the top bar for 1-2 lines.
-    title_y = max(34, int(top_h * 0.16) + title_y_offset)
+    # Keep more breathing room under the top bar so notch areas don't overlap.
+    title_y = max(34, int(top_h * 0.24) + title_y_offset)
     ass_safe = _ffmpeg_escape(str(ass_path))
 
     vf = (
@@ -2956,12 +2986,20 @@ def main() -> int:
             default=0.12,
             key="subtitle_sync_max_scale_delta",
         )
+        subtitle_max_first_start_s = _coerce_float(
+            config.get("subtitle_max_first_start_s"),
+            default=1.2,
+            key="subtitle_max_first_start_s",
+        )
         if subtitle_sync_max_scale_delta < 0:
             print("[-] subtitle_sync_max_scale_delta is negative; using 0.12")
             subtitle_sync_max_scale_delta = 0.12
         if subtitle_sync_max_scale_delta > 1:
             print("[-] subtitle_sync_max_scale_delta is too large; clamping to 1.0")
             subtitle_sync_max_scale_delta = 1.0
+        if subtitle_max_first_start_s < 0:
+            print("[-] subtitle_max_first_start_s is negative; using 0")
+            subtitle_max_first_start_s = 0.0
 
         subtitle_ok = False
         subtitle_method = "none"
@@ -2984,6 +3022,7 @@ def main() -> int:
                     repair_max_drift=subtitle_sync_repair_max_drift,
                     max_scale_delta=subtitle_sync_max_scale_delta,
                     validate_max_drift=subtitle_sync_tolerance,
+                    validate_max_first_start_s=subtitle_max_first_start_s,
                     label="openai",
                 ):
                     subtitle_ok = True
@@ -3010,6 +3049,7 @@ def main() -> int:
                     repair_max_drift=subtitle_sync_repair_max_drift,
                     max_scale_delta=subtitle_sync_max_scale_delta,
                     validate_max_drift=subtitle_sync_tolerance,
+                    validate_max_first_start_s=subtitle_max_first_start_s,
                     label="script_split",
                 ):
                     subtitle_ok = True
