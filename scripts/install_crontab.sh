@@ -9,7 +9,7 @@ H="${TIME%:*}"
 M="${TIME#*:}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CMD="cd $ROOT_DIR && ./scripts/run_scheduled.sh >> logs/cron_\$(date +\\%Y\\%m\\%d).log 2>&1"
+CMD="LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 PYTHONIOENCODING=utf-8 cd $ROOT_DIR && ./scripts/run_scheduled.sh >> logs/cron_\$(date +\\%Y\\%m\\%d).log 2>&1"
 
 mkdir -p "$ROOT_DIR/logs"
 
@@ -26,4 +26,3 @@ rm -f "$tmp"
 
 echo "Installed. Verify with: crontab -l"
 echo "If it doesn't run on WSL, enable systemd/cron and start the cron service."
-

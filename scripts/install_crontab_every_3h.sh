@@ -15,7 +15,7 @@ if ! [[ "$MINUTE" =~ ^[0-5]?[0-9]$ ]]; then
   exit 2
 fi
 
-CMD="cd $ROOT_DIR && CLEANUP_ALL_ARTIFACTS=1 ./scripts/run_scheduled.sh >> logs/cron_\$(date +\\%Y\\%m\\%d).log 2>&1"
+CMD="LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 PYTHONIOENCODING=utf-8 cd $ROOT_DIR && CLEANUP_ALL_ARTIFACTS=1 ./scripts/run_scheduled.sh >> logs/cron_\$(date +\%Y\%m\%d).log 2>&1"
 
 tmp="$(mktemp)"
 crontab -l 2>/dev/null | grep -v "run_scheduled.sh" > "$tmp" || true

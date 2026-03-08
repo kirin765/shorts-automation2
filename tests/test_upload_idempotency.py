@@ -43,7 +43,41 @@ class TestUploadIdempotency(unittest.TestCase):
             self.assertEqual(obj["job_key"], "k")
             self.assertEqual(obj["video_id"], "v")
 
+    def test_lookup_supports_results_map(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "uploads.jsonl"
+            key = "/abs/path/to/job.json"
+
+            p.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "job_key": key,
+                                "results": {
+                                    "youtube": {
+                                        "video_id": "yt_old",
+                                        "upload_url": "https://youtu.be/yt_old",
+                                    },
+                                    "tiktok": {"upload_url": "https://www.tiktok.com/@user/video/111"},
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            rec = run_short._lookup_uploaded_record(p, key)
+            self.assertIsNotNone(rec)
+            assert rec is not None
+            res = run_short._upload_results_from_record(rec)
+            self.assertIn("youtube", res)
+            self.assertIn("tiktok", res)
+            self.assertEqual(res["youtube"]["video_id"], "yt_old")
+            self.assertEqual(res["tiktok"]["upload_url"], "https://www.tiktok.com/@user/video/111")
+
 
 if __name__ == "__main__":
     unittest.main()
-

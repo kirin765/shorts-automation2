@@ -2,6 +2,9 @@
 set -euo pipefail
 
 CONFIG="ENV"
+if [[ "$CONFIG" == "ENV" && -f "config.json" ]]; then
+  CONFIG="config.json"
+fi
 QUEUE_DIR="jobs/queue"
 DONE_DIR="jobs/done"
 FAILED_DIR="jobs/failed"
