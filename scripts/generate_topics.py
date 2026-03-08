@@ -87,6 +87,31 @@ _LOW_INTEREST_MARKERS = {
     "샘플",
 }
 
+_STYLE_RULES: list[tuple[list[str], str]] = [
+    (["smartphone", "ios", "android", "아이폰", "갤럭시", "모바일", "휴대폰", "배터리", "화면 잠금"], "테크 뉴스, 한 문장 짧게"),
+    (["ai", "인공지능", "인공 지능", "머신러닝", "딥러닝", "챗", "gpt", "llm", "모델"], "테크 뉴스, 실무형 단문 위주"),
+    (["stock", "주식", "코인", "경제", "금융", "비트코인", "환율", "투자", "금리", "ETF", "암호화폐"], "금융/경제 트렌드, 핵심 포인트 중심"),
+    (["recipe", "요리", "커피", "식단", "헬스", "운동", "다이어트", "건강", "의료", "질병"], "실생활/건강 팁, 바로 실행 가능한 방식"),
+    (["game", "게임", "아이돌", "연예", "영화", "드라마", "음악", "리뷰"], "엔터/리뷰형, 비교형 포인트 우선"),
+    (["travel", "여행", "국내", "해외", "가성비", "숙소", "호텔", "항공", "휴양"], "라이프/여행 가이드형, 바로 실행 가능한 체크리스트"),
+]
+
+
+def _infer_style_from_trends(niche: str, trend_seeds: list[str], fallback_style: str) -> str:
+    """Infer a topic-style hint from niche/trend context.
+
+    Keeps the provided fallback when no rule matches.
+    """
+    context = _normalize_text(f"{niche} {' '.join(trend_seeds)}").lower()
+    if not context:
+        return fallback_style
+
+    for markers, style in _STYLE_RULES:
+        if any(marker in context for marker in markers):
+            return style
+
+    return fallback_style
+
 
 def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
@@ -158,7 +183,20 @@ def _is_high_interest_topic(topic: str) -> bool:
 def fetch_google_trending_topics(cfg: dict, *, geo: str, limit: int, timeout_s: int) -> list[str]:
     # Unofficial RSS endpoint without API key.
     url = "https://trends.google.com/trendingsearches/daily/rss"
-    response = requests.get(url, params={"geo": geo, "hl": "ko"}, timeout=timeout_s)
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(
+            url,
+            params={"geo": geo, "hl": "ko"},
+            timeout=timeout_s,
+            headers=headers,
+        )
+    except requests.RequestException as exc:
+        print(f"[topics] google trending request failed: {exc}")
+        return []
+    if response.status_code == 404:
+        print("[topics] google trending endpoint is unavailable (404); skipping google source")
+        return []
     response.raise_for_status()
     root = ET.fromstring(response.text)
     out: list[str] = []
@@ -170,7 +208,7 @@ def fetch_google_trending_topics(cfg: dict, *, geo: str, limit: int, timeout_s: 
         if len(out) >= max(1, limit):
             break
     if not out:
-        raise RuntimeError("Google Trends RSS returned no topics")
+        print("Google Trends RSS returned no topics")
     return out
 
 
@@ -212,6 +250,16 @@ def collect_trend_seeds(cfg: dict) -> list[str]:
     geo = _coerce_str(cfg.get("trend_region"), default="KR")
     limit = _coerce_int(cfg.get("trend_seed_count", 8), default=8)
     timeout_s = _coerce_int(cfg.get("trend_timeout_s", 12), default=12)
+    has_youtube_key = bool(
+        (
+            cfg.get("google_api_key")
+            or cfg.get("youtube_api_key")
+            or os.environ.get("GOOGLE_API_KEY")
+            or os.environ.get("YOUTUBE_API_KEY")
+        ).strip()
+    )
+    if not has_youtube_key:
+        print("[topics] YouTube trend source skipped: no API key. Set GOOGLE_API_KEY or YOUTUBE_API_KEY.")
 
     providers = {
         "google": fetch_google_trending_topics,
@@ -224,6 +272,8 @@ def collect_trend_seeds(cfg: dict) -> list[str]:
         fn = providers.get(source.lower())
         if not fn:
             print(f"[topics] unknown trend source skipped: {source!r}")
+            continue
+        if source.lower() == "youtube" and not has_youtube_key:
             continue
         try:
             for item in fn(cfg, geo=geo, limit=limit, timeout_s=timeout_s):
@@ -329,8 +379,14 @@ def main() -> int:
     ap.add_argument("--history", default="jobs/topics_history.txt")
     ap.add_argument("--count", type=int, default=10)
     ap.add_argument("--language", default="ko")
-    ap.add_argument("--niche", default="tech/ai/internet")
-    ap.add_argument("--style", default="tech news, concise")
+    ap.add_argument("--niche", default="")
+    ap.add_argument("--style", default="")
+    ap.add_argument(
+        "--style-mode",
+        choices=("auto", "fixed"),
+        default="",
+        help="auto: infer style from niche+trend seeds, fixed: use provided --style value",
+    )
     ap.add_argument("--avoid-days", type=int, default=60, help="Reserved for future date-scoped history filtering.")
     ap.add_argument(
         "--uniqueness-mode",
@@ -360,6 +416,18 @@ def main() -> int:
     if max_attempts < 1:
         raise SystemExit(f"--max-attempts must be >= 1 (got {max_attempts})")
     trend_seeds = collect_trend_seeds(cfg)
+    niche = _coerce_str(
+        args.niche,
+        default=_coerce_str(cfg.get("topic_niche_default"), default="테크/AI/인터넷 트렌드"),
+    )
+    style_default = _coerce_str(
+        args.style,
+        default=_coerce_str(cfg.get("topic_style_default"), default="tech news, concise"),
+    )
+    style_mode = _coerce_str((args.style_mode or cfg.get("topic_style_mode")), default="auto").strip().lower()
+    if style_mode not in {"auto", "fixed"}:
+        raise SystemExit(f"Invalid style mode: {style_mode!r}. expected auto|fixed")
+    style = style_default if style_mode == "fixed" else _infer_style_from_trends(niche, trend_seeds, style_default)
 
     out_path = Path(args.out)
     hist_path = Path(args.history)
@@ -374,7 +442,7 @@ def main() -> int:
 
     print(
         f"[topics] policy mode={uniqueness_mode} target_count={args.count} max_attempts={max_attempts} "
-        f"history_size={len(existing)} trend_seeds={len(trend_seeds)}"
+        f"history_size={len(existing)} trend_seeds={len(trend_seeds)} style={style}"
     )
 
     for attempt in range(1, max_attempts + 1):
@@ -393,8 +461,8 @@ def main() -> int:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 language=args.language,
-                niche=args.niche,
-                style=args.style,
+                niche=niche,
+                style=style,
                 today=today,
                 request_count=request_count,
                 avoid_topics=avoid_topics,

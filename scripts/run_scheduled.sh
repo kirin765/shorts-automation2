@@ -7,6 +7,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# Force UTF-8 output for cron/non-interactive environments.
+export LANG="${LANG:-C.UTF-8}"
+export LC_ALL="${LC_ALL:-C.UTF-8}"
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+export PYTHONUNBUFFERED=1
+
 # Prevent overlapping runs (cron can fire while a previous run is still executing).
 LOCKFILE="${LOCKFILE:-$ROOT_DIR/.shorts_automation2.lock}"
 if [[ "${_LOCKED:-0}" != "1" ]] && command -v flock >/dev/null 2>&1; then
@@ -60,12 +66,16 @@ notify_openclaw() {
 }
 
 CONFIG="${CONFIG:-ENV}"
+if [[ "$CONFIG" == "ENV" && -f "config.json" ]]; then
+  CONFIG="config.json"
+fi
 COUNT="${COUNT:-1}"
 NO_UPLOAD="${NO_UPLOAD:-0}"   # 1 to skip upload
 TARGET_SECONDS="${TARGET_SECONDS:-28}"
-NICHE="${NICHE:-테크/AI/인터넷 트렌드}"
-STYLE="${STYLE:-테크 뉴스, 한 문장 짧게}"
+NICHE="${NICHE:-}"
+STYLE="${STYLE:-}"
 TONE="${TONE:-빠르고 자신있게}"
+STYLE_MODE="${STYLE_MODE:-auto}"
 GEN_TOPIC_COUNT="${GEN_TOPIC_COUNT:-10}"
 CLEANUP_ALL_ARTIFACTS="${CLEANUP_ALL_ARTIFACTS:-1}"
 BACKGROUND_PROVIDER="${BACKGROUND_PROVIDER:-pexels}"
@@ -88,13 +98,23 @@ export OPENCLAW_NOTIFY_ON_FAILURE="1"
 
 set +e
 {
-  "$PY_BIN" scripts/generate_topics.py \
+  topic_cmd=(
+    "$PY_BIN" scripts/generate_topics.py \
     --config "$CONFIG" \
     --out jobs/topics.txt \
     --history jobs/topics_history.txt \
     --count "$GEN_TOPIC_COUNT" \
-    --niche "$NICHE" \
-    --style "$STYLE"
+  )
+
+  if [[ -n "$NICHE" ]]; then
+    topic_cmd+=(--niche "$NICHE")
+  fi
+  if [[ -n "$STYLE" ]]; then
+    topic_cmd+=(--style "$STYLE")
+  fi
+  topic_cmd+=(--style-mode "$STYLE_MODE")
+
+  "${topic_cmd[@]}"
 
   topic_count="$(
     grep -Ev '^\s*(#|$)' jobs/topics.txt 2>/dev/null | wc -l | tr -d ' '
@@ -108,7 +128,10 @@ set +e
     exit 1
   fi
 
-  cmd=("$PY_BIN" scripts/run_daily.py --config "$CONFIG" --topics-file jobs/topics.txt --count "$COUNT" --target-seconds "$TARGET_SECONDS" --style "$STYLE" --tone "$TONE")
+  cmd=("$PY_BIN" scripts/run_daily.py --config "$CONFIG" --topics-file jobs/topics.txt --count "$COUNT" --target-seconds "$TARGET_SECONDS" --tone "$TONE")
+  if [[ "$STYLE_MODE" == "fixed" && -n "$STYLE" ]]; then
+    cmd+=(--style "$STYLE")
+  fi
   if [[ "$NO_UPLOAD" == "1" ]]; then
     cmd+=(--no-upload)
   fi
