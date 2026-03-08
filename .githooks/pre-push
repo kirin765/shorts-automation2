@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+
+if [[ ! -d "$ROOT_DIR" ]]; then
+  echo "Cannot locate repository root" >&2
+  exit 1
+fi
+
+SCRIPT="$ROOT_DIR/scripts/scan_secret_guard.py"
+
+if [[ ! -x "$SCRIPT" && ! -f "$SCRIPT" ]]; then
+  echo "Missing script: $SCRIPT" >&2
+  exit 1
+fi
+
+cd "$ROOT_DIR"
+
+python3 "$SCRIPT" config.json secrets
+exit $?
