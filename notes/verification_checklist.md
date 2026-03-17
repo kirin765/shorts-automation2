@@ -9,12 +9,12 @@
 - 로그 파일을 남겼는가 (추천):
 
 ```bash
-NO_UPLOAD=1 python -u run_short.py --config config.json --job jobs/today.json 2>&1 | tee logs/run_$(date +%Y%m%d_%H%M%S).log
+NO_UPLOAD=1 python -u -m shorts render --config ENV --job jobs/today.json 2>&1 | tee logs/run_$(date +%Y%m%d_%H%M%S).log
 ```
 
 ## 2) 파일 존재/경로
 
-- `output/`(또는 `config.json`의 `output_dir`) 아래에 아래 파일이 생성됐는가
+- `output/`(또는 `app.output_dir`) 아래에 아래 파일이 생성됐는가
 - `output/YYYYMMDD_HHMMSS.mp4`
 - `output/YYYYMMDD_HHMMSS.mp3`
 - `output/YYYYMMDD_HHMMSS.srt`
@@ -50,8 +50,8 @@ ffprobe -hide_banner -v error \
 
 WSL에서 한글 폰트가 안 잡히면 자막이 안 보일 수 있다.
 - 기본 동작: `font_file`의 폴더를 `subtitles`에 `fontsdir`로 지정
-- 필요하면 `config.json`에 `subtitle_fontsdir` 지정
-- 필요 시 `subtitle_position`, `subtitle_margin_top_v`, `subtitle_margin_bottom_v`, `subtitle_sync_repair`, `subtitle_sync_repair_max_drift`, `subtitle_sync_max_scale_delta`, `subtitle_sync_drift_tolerance`로 미세 조정
+- 필요하면 `render.subtitle_fontsdir` 지정
+- 필요 시 `render.subtitle_position`, `render.subtitle_margin_top_v`, `render.subtitle_margin_bottom_v`, `render.subtitle_sync_repair`, `render.subtitle_sync_repair_max_drift`, `render.subtitle_sync_max_scale_delta`, `render.subtitle_sync_drift_tolerance`로 미세 조정
 
 ## 5) 메타데이터(업로드/게시)
 
@@ -69,4 +69,4 @@ WSL에서 한글 폰트가 안 잡히면 자막이 안 보일 수 있다.
 ## 6) 업로드 전 자동 체크(가드레일)
 
 이 프로젝트는 업로드 직전에 자동 체크를 수행한다(제목/해시태그/세로비율/오디오/길이 등).
-체크를 강화/조정하려면 `config.json`의 `youtube.*` 제한값을 확인/수정한다.
+체크를 강화/조정하려면 `youtube.*` 제한값을 확인/수정한다.

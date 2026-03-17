@@ -1,23 +1,24 @@
+from __future__ import annotations
+
 import json
+import os
 import unittest
 
-import run_short
+from shorts.output import _env_truthy, _one_line, _summary_line, format_result_line
 
 
-class TestSummaryLine(unittest.TestCase):
+class TestOutput(unittest.TestCase):
     def test_env_truthy(self) -> None:
-        import os
-
         old = os.environ.get("NO_UPLOAD")
         try:
             os.environ.pop("NO_UPLOAD", None)
-            self.assertFalse(run_short._env_truthy("NO_UPLOAD"))
+            self.assertFalse(_env_truthy("NO_UPLOAD"))
             os.environ["NO_UPLOAD"] = "1"
-            self.assertTrue(run_short._env_truthy("NO_UPLOAD"))
+            self.assertTrue(_env_truthy("NO_UPLOAD"))
             os.environ["NO_UPLOAD"] = "true"
-            self.assertTrue(run_short._env_truthy("NO_UPLOAD"))
+            self.assertTrue(_env_truthy("NO_UPLOAD"))
             os.environ["NO_UPLOAD"] = "0"
-            self.assertFalse(run_short._env_truthy("NO_UPLOAD"))
+            self.assertFalse(_env_truthy("NO_UPLOAD"))
         finally:
             if old is None:
                 os.environ.pop("NO_UPLOAD", None)
@@ -25,21 +26,17 @@ class TestSummaryLine(unittest.TestCase):
                 os.environ["NO_UPLOAD"] = old
 
     def test_one_line_collapses_whitespace(self) -> None:
-        s = "a\nb\tc  d"
-        out = run_short._one_line(s)
-        self.assertEqual(out, "a b c d")
-        self.assertNotIn("\n", out)
+        self.assertEqual(_one_line("a\nb\tc  d"), "a b c d")
 
     def test_summary_line_is_single_line_json(self) -> None:
-        line = run_short._summary_line({"status": "ok", "elapsed_s": 1.234, "video": "output/x.mp4"})
+        line = _summary_line({"status": "ok", "elapsed_s": 1.234, "video": "output/x.mp4"})
         self.assertTrue(line.startswith("SUMMARY "))
         self.assertNotIn("\n", line)
-        payload = line[len("SUMMARY ") :]
-        obj = json.loads(payload)
-        self.assertEqual(obj["status"], "ok")
+        payload = json.loads(line[len("SUMMARY ") :])
+        self.assertEqual(payload["status"], "ok")
 
     def test_result_line_includes_video_id_when_present(self) -> None:
-        line = run_short.format_result_line(
+        line = format_result_line(
             status="ok",
             elapsed_s=1.234,
             video=None,
@@ -51,7 +48,3 @@ class TestSummaryLine(unittest.TestCase):
         self.assertIn("status=ok", line)
         self.assertIn("video_id=abc123", line)
         self.assertIn("upload=https://youtu.be/abc123", line)
-
-
-if __name__ == "__main__":
-    unittest.main()

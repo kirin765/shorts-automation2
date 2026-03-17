@@ -14,5 +14,4 @@ python -m pip install -U pip
 pip install -r requirements.txt
 
 echo "[3/3] Done"
-echo "Try: python run_short.py --config config.json --job jobs/today.json --no-upload"
-
+echo "Try: . .venv/bin/activate && python -m shorts render --config ENV --job jobs/today.json --no-upload"

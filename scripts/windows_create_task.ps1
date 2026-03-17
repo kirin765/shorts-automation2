@@ -14,8 +14,8 @@ if (!(Test-Path $wsl)) { throw "wsl.exe not found: $wsl" }
 $distroArg = ""
 if ($Distro -ne "") { $distroArg = "-d $Distro" }
 
-# Run the scheduled wrapper; it will generate topics then run the queue.
-$bashCmd = "cd $RepoPathWsl && ./scripts/run_scheduled.sh"
+# Run the daily pipeline; it will generate topics, draft render jobs, then run the queue.
+$bashCmd = "cd $RepoPathWsl && if [ -f .venv/bin/activate ]; then . .venv/bin/activate; fi && python -m shorts pipeline daily --config ENV"
 $taskCmd = "`"$wsl`" $distroArg -- bash -lc `"$bashCmd`""
 
 Write-Host "Creating task '$TaskName' at $Time"
@@ -28,4 +28,3 @@ schtasks.exe /Create /F `
   /ST $Time
 
 Write-Host "Done. Check with: schtasks.exe /Query /TN $TaskName /V /FO LIST"
-
