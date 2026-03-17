@@ -91,10 +91,104 @@ elif command -v python >/dev/null 2>&1; then
   PY_BIN="python"
 fi
 
+cleanup_output_artifacts() {
+  "$PY_BIN" - "$CONFIG" <<'PY'
+from config_loader import load_config
+from pathlib import Path
+from datetime import datetime, timedelta
+import os
+import shutil
+import sys
+
+cfg = load_config(sys.argv[1] if len(sys.argv) > 1 else "ENV")
+if str(cfg.get("output_cleanup_enabled", True)).strip().lower() in {"0", "false", "no", "off"}:
+    raise SystemExit(0)
+
+out_dir = Path(cfg.get("output_dir", "output"))
+if not out_dir.exists():
+    raise SystemExit(0)
+
+keep_latest = max(0, int(cfg.get("output_cleanup_keep_latest", 30) or 30))
+keep_days = max(0, float(cfg.get("output_cleanup_keep_days", 5) or 5))
+min_free_gb = max(0.0, float(cfg.get("output_cleanup_min_free_gb", 5) or 5))
+min_free_bytes = int(min_free_gb * (1024 ** 3))
+cutoff = datetime.now() - timedelta(days=keep_days)
+
+groups: dict[str, list[Path]] = {}
+for path in out_dir.iterdir():
+    if not path.is_file():
+        continue
+    name = path.name
+    stamp = name.split(".", 1)[0]
+    if len(stamp) != 15 or stamp[8] != "_":
+        continue
+    groups.setdefault(stamp, []).append(path)
+
+ordered = sorted(groups.items(), key=lambda item: item[0], reverse=True)
+keep_stamps = {stamp for stamp, _ in ordered[:keep_latest]}
+
+deleted = 0
+freed = 0
+for stamp, paths in ordered[keep_latest:]:
+    newest_mtime = max((p.stat().st_mtime for p in paths), default=0.0)
+    if datetime.fromtimestamp(newest_mtime) > cutoff:
+        continue
+    for path in paths:
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            continue
+        try:
+            path.unlink()
+            deleted += 1
+            freed += size
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            print(f"[-] output cleanup failed for {path}: {exc}")
+
+usage = shutil.disk_usage(out_dir)
+if deleted:
+    print(f"[cleanup] removed_files={deleted} freed_bytes={freed} keep_latest={keep_latest} keep_days={keep_days}")
+print(f"[cleanup] free_bytes={usage.free} min_required_bytes={min_free_bytes}")
+if usage.free < min_free_bytes:
+    raise SystemExit(f"insufficient free disk after cleanup: free={usage.free} required={min_free_bytes}")
+PY
+}
+
+SLOT_STATUS="$("$PY_BIN" - "$CONFIG" "$NO_UPLOAD" <<'PY'
+from config_loader import load_config
+from datetime import datetime
+import sys
+
+cfg = load_config(sys.argv[1] if len(sys.argv) > 1 else "ENV")
+no_upload = str(sys.argv[2] if len(sys.argv) > 2 else "0").strip() == "1"
+raw_slots = cfg.get("upload_slots_hours") or [0, 8, 16]
+slots = []
+for item in raw_slots:
+    try:
+        slots.append(int(item) % 24)
+    except Exception:
+        continue
+if not slots:
+    slots = [0, 8, 16]
+enforce = str(cfg.get("enforce_upload_slots", True)).strip().lower() not in {"0", "false", "no", "off"}
+hour = datetime.now().hour
+print("run" if no_upload or (not enforce) or hour in slots else "skip")
+PY
+)"
+
 export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
 export CLEANUP_ALL_ARTIFACTS
 export BACKGROUND_PROVIDER
 export OPENCLAW_NOTIFY_ON_FAILURE="1"
+
+if [[ "$SLOT_STATUS" == "skip" ]]; then
+  echo "[schedule] current hour is outside upload_slots_hours; skipping upload run"
+  exit 0
+fi
+
+cleanup_output_artifacts
 
 set +e
 {

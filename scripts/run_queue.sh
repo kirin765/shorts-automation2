@@ -76,6 +76,21 @@ python_cmd() {
   "$py_bin" -u run_short.py --config "$CONFIG" --job "$job" "${cleanup_flag[@]}" "${no_upload_flag[@]}"
 }
 
+python_syntax_preflight() {
+  local py_bin="python3"
+  if [[ -x ".venv/bin/python" ]]; then
+    py_bin=".venv/bin/python"
+  elif command -v python >/dev/null 2>&1; then
+    py_bin="python"
+  elif ! command -v "$py_bin" >/dev/null 2>&1; then
+    echo "python interpreter not found (python/python3/.venv/bin/python)" >&2
+    return 127
+  fi
+
+  echo "Preflight: py_compile run_short.py"
+  "$py_bin" -m py_compile run_short.py
+}
+
 run_job() {
   local job="$1"
   local base
@@ -145,6 +160,8 @@ run_job() {
     echo "No jobs in $QUEUE_DIR"
     exit 0
   fi
+
+  python_syntax_preflight
 
   failed=0
   for j in "${jobs[@]}"; do

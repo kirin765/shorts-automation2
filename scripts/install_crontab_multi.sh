@@ -3,14 +3,14 @@ set -euo pipefail
 
 # Installs multiple crontab entries to run the scheduled wrapper.
 # Usage:
-#   ./scripts/install_crontab_multi.sh 09:00 12:00 15:00 18:00 21:00
-# If no times are provided, it installs a reasonable 5-times-a-day default.
+#   ./scripts/install_crontab_multi.sh 00:00 08:00 16:00
+# If no times are provided, it installs the default 3-times-a-day schedule.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mkdir -p "$ROOT_DIR/logs"
 
 if [[ $# -eq 0 ]]; then
-  TIMES=("09:00" "12:00" "15:00" "18:00" "21:00")
+  TIMES=("00:00" "08:00" "16:00")
 else
   TIMES=("$@")
 fi

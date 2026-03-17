@@ -33,6 +33,11 @@ class Job:
     tone: str | None = None
     target_seconds: int | None = None
     subtopic: str | None = None
+    topic_source: str | None = None
+    grounding_note: str | None = None
+    semantic_status: str | None = None
+    judge_feedback: str | None = None
+    ab_winner: str | None = None
 
 
 def run(cmd: list[str]) -> None:
@@ -1035,9 +1040,12 @@ def openai_generate_job(config: dict, job: Job) -> Job:
     api_key = _openai_api_key(config)
     base_url = (config.get("openai_base_url") or "https://api.openai.com/v1").rstrip("/")
     model = (config.get("openai_script_model") or config.get("openai_model") or "gpt-4o-mini").strip()
+    judge_model = (config.get("openai_judge_model") or model).strip()
     timeout_s = int(config.get("openai_timeout_s", 40))
     temperature = float(config.get("openai_temperature", 0.7))
     max_tokens = int(config.get("openai_max_output_tokens", 650))
+    ab_enabled = _coerce_bool(config.get("ab_script_enabled"), default=True)
+    semantic_retry_limit = max(0, int(config.get("ab_semantic_retry_limit", 1)))
 
     language = _resolve_openai_language(config.get("openai_script_language"))
     if not language:
@@ -1045,6 +1053,8 @@ def openai_generate_job(config: dict, job: Job) -> Job:
     if not language:
         language = str(config.get("default_language", "")).strip() or ""
     target_seconds = int(job.target_seconds or config.get("shorts_target_seconds", 28))
+    topic_source = (job.topic_source or "regular").strip().lower() or "regular"
+    grounding_note = (job.grounding_note or "").strip()
 
     topic = (job.topic or job.title or "").strip()
     if not topic:
@@ -1082,48 +1092,6 @@ def openai_generate_job(config: dict, job: Job) -> Job:
         system += (
             " For smartphone/mobile topics, each tip must explicitly label OS applicability "
             "(안드로이드 전용 / iOS 전용 / 양쪽 공통) and mention version/device constraints where needed."
-        )
-    user_parts = [
-        f"Topic: {topic}",
-    ]
-    if subtopic:
-        user_parts.append(f"Subtopic: {subtopic}")
-    user_parts.extend(
-        [
-        f"Style: {job.style or 'tech news / explain like I am busy'}",
-        f"Tone: {job.tone or 'confident, concise'}",
-        f"Target duration: about {target_seconds} seconds of narration.",
-        "Use topic/subtopic phrasing as context, then write one clear title and script."
-    ])
-    if language:
-        user_parts.insert(0, f"Language: {language}")
-    user = (
-        "\n".join(user_parts)
-        + "\n"
-        + "\n".join(
-            [
-                "Output rules:",
-                "- title: <= 28 chars, curiosity-driven, no clickbait lies.",
-                "- script: 6-9 short lines/sentences. First sentence must be the hook, 2nd sentence should raise tension.",
-                "- script must contain: 1) 한 가지 구체적 장면 or 사례, 2) 바로 적용 가능한 한 줄 팁, 3) 마지막 1줄 CTA.",
-                "- Avoid long clauses and abstract statements. Each sentence should be easy to read in subtitles.",
-                "- description: 1-2 clear sentences.",
-                "- hashtags: 3-5 tags including #shorts.",
-                "- pexels_query: 4-8 English words, no brand names.",
-                "Quality requirements:",
-                "- first line: hook question/반전/도전식 문장.",
-                "- middle: at least 1 vivid example (예: '예를 들어', '실제로').",
-                "- ending: one direct CTA (좋아요/구독/댓글/좋은 영상 확인 유도).",
-                "- no markdown, no list wrappers, output plain JSON only.",
-            ]
-        )
-    )
-    if mobile_topic:
-        user += (
-            "\n"
-            "For smartphone/mobile content, output script in numbered short tips (ex: 1),2),3)) where each tip explicitly states "
-            "OS applicability (안드로이드 전용, iOS 전용, 또는 양쪽 공통) and adds practical caveats "
-            "(예: '안드로이드 12+ 전용', 'iOS 16+', '양쪽 공통')."
         )
 
     schema = {
@@ -1173,28 +1141,7 @@ def openai_generate_job(config: dict, job: Job) -> Job:
             return False
         return True
 
-    payload = {
-        "model": model,
-        "input": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": temperature,
-        "max_output_tokens": max_tokens,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "shorts_job",
-                "schema": schema,
-                "strict": True,
-            }
-        },
-        "store": False,
-    }
-
-    script_attempts = 2
-    obj = {}
-    for _ in range(script_attempts):
+    def _call_responses(payload: dict[str, Any]) -> dict[str, Any]:
         r = requests.post(
             f"{base_url}/responses",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -1212,7 +1159,6 @@ def openai_generate_job(config: dict, job: Job) -> Job:
                 msg = r.text
             raise RuntimeError(f"OpenAI responses request failed ({r.status_code}): {_one_line(str(msg))}")
         data = r.json()
-
         text_out = None
         for item in data.get("output", []) or []:
             for c in item.get("content", []) or []:
@@ -1223,33 +1169,249 @@ def openai_generate_job(config: dict, job: Job) -> Job:
                 break
         if not text_out:
             raise RuntimeError("OpenAI response did not include expected output text.")
+        return json.loads(text_out)
 
-        obj = json.loads(text_out)
+    def _build_candidate_user(variant_name: str, feedback: str) -> str:
+        variant_rule = (
+            "Variant A: start with a direct warning/question hook."
+            if variant_name == "A"
+            else "Variant B: start with a concrete scene/example or contrast hook."
+        )
+        user_parts = [f"Topic: {topic}"]
+        if subtopic:
+            user_parts.append(f"Subtopic: {subtopic}")
+        user_parts.extend(
+            [
+                f"Topic source: {topic_source}",
+                f"Style: {job.style or 'tech news / explain like I am busy'}",
+                f"Tone: {job.tone or 'confident, concise'}",
+                f"Target duration: about {target_seconds} seconds of narration.",
+                variant_rule,
+                "Use topic/subtopic phrasing as context, then write one clear title and script.",
+            ]
+        )
+        if language:
+            user_parts.insert(0, f"Language: {language}")
+        if grounding_note:
+            user_parts.append(f"Meaning grounding: {grounding_note}")
+        if topic_source == "trend":
+            user_parts.append(
+                "This topic came from YouTube trends. Never guess what unfamiliar proper nouns mean. "
+                "If a term is unfamiliar, follow Meaning grounding exactly and keep the script in that domain."
+            )
+        if feedback:
+            user_parts.append(f"Fix these semantic issues from the last attempt: {feedback}")
+        user = (
+            "\n".join(user_parts)
+            + "\n"
+            + "\n".join(
+                [
+                    "Output rules:",
+                    "- title: <= 28 chars, curiosity-driven, no clickbait lies.",
+                    "- script: 6-9 short lines/sentences. First sentence must be the hook, 2nd sentence should raise tension.",
+                    "- script must contain: 1) 한 가지 구체적 장면 or 사례, 2) 바로 적용 가능한 한 줄 팁, 3) 마지막 1줄 CTA.",
+                    "- Avoid long clauses and abstract statements. Each sentence should be easy to read in subtitles.",
+                    "- description: 1-2 clear sentences.",
+                    "- hashtags: 3-5 tags including #shorts.",
+                    "- pexels_query: 4-8 English words, no brand names.",
+                    "Quality requirements:",
+                    "- first line: hook question/반전/도전식 문장.",
+                    "- middle: at least 1 vivid example (예: '예를 들어', '실제로').",
+                    "- ending: one direct CTA (좋아요/구독/댓글/좋은 영상 확인 유도).",
+                    "- no markdown, no list wrappers, output plain JSON only.",
+                ]
+            )
+        )
+        if mobile_topic:
+            user += (
+                "\n"
+                "For smartphone/mobile content, output script in numbered short tips (ex: 1),2),3)) where each tip explicitly states "
+                "OS applicability (안드로이드 전용, iOS 전용, 또는 양쪽 공통) and adds practical caveats "
+                "(예: '안드로이드 12+ 전용', 'iOS 16+', '양쪽 공통')."
+            )
+        return user
+
+    def _generate_candidate(variant_name: str, feedback: str) -> dict[str, Any]:
+        payload = {
+            "model": model,
+            "input": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": _build_candidate_user(variant_name, feedback)},
+            ],
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "shorts_job",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+            "store": False,
+        }
+
+        obj: dict[str, Any] = {}
+        for _ in range(2):
+            obj = _call_responses(payload)
+            script = (obj.get("script") or "").strip()
+            if _is_quality_script(script):
+                break
+            print("[-] Generated script failed quality check; regenerating once.")
+
+        title = (obj.get("title") or "").strip()
         script = (obj.get("script") or "").strip()
-        if _is_quality_script(script):
-            break
-        print("[-] Generated script failed quality check; regenerating once.")
-        continue
+        description = (obj.get("description") or "").strip()
+        hashtags = (obj.get("hashtags") or "").strip()
+        pexels_query = (obj.get("pexels_query") or "").strip()
+        if not (title and script and description and hashtags and pexels_query):
+            raise RuntimeError("OpenAI returned incomplete job fields. expected title/script/description/hashtags/pexels_query")
+        obj["_variant"] = variant_name
+        return obj
 
-    title = (obj.get("title") or "").strip()
-    script = (obj.get("script") or "").strip()
-    description = (obj.get("description") or "").strip()
-    hashtags = (obj.get("hashtags") or "").strip()
-    pexels_query = (obj.get("pexels_query") or "").strip()
-    if not (title and script and description and hashtags and pexels_query):
-        raise RuntimeError("OpenAI returned incomplete job fields. expected title/script/description/hashtags/pexels_query")
+    def _judge_candidates(candidate_a: dict[str, Any], candidate_b: dict[str, Any]) -> dict[str, Any]:
+        judge_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "candidate_a_pass": {"type": "boolean"},
+                "candidate_b_pass": {"type": "boolean"},
+                "winner": {"type": "string", "enum": ["A", "B", "retry"]},
+                "feedback": {"type": "string"},
+                "candidate_a_reason": {"type": "string"},
+                "candidate_b_reason": {"type": "string"},
+            },
+            "required": [
+                "candidate_a_pass",
+                "candidate_b_pass",
+                "winner",
+                "feedback",
+                "candidate_a_reason",
+                "candidate_b_reason",
+            ],
+        }
+        judge_system = (
+            "You are a semantic sanity editor for Korean YouTube Shorts scripts. "
+            "Your main job is to reject scripts that do not actually make sense for the topic. "
+            "Check whether unfamiliar nouns/proper nouns are understood correctly. "
+            "Example failure: treating '염라' like an SNS or chat service and saying '염라로 소통하세요'. "
+            "Prefer the candidate that best matches the actual meaning of the topic and stays logically coherent."
+        )
+        judge_user = (
+            f"Topic: {topic}\n"
+            f"Subtopic: {subtopic or '(none)'}\n"
+            f"Topic source: {topic_source}\n"
+            f"Meaning grounding: {grounding_note or '(none)'}\n\n"
+            f"Candidate A:\nTitle: {candidate_a.get('title', '')}\nScript:\n{candidate_a.get('script', '')}\nDescription: {candidate_a.get('description', '')}\n\n"
+            f"Candidate B:\nTitle: {candidate_b.get('title', '')}\nScript:\n{candidate_b.get('script', '')}\nDescription: {candidate_b.get('description', '')}\n\n"
+            "Judge mainly on whether the script actually makes sense. "
+            "If both are semantically broken, return winner=retry and explain what must be fixed."
+        )
+        return _call_responses(
+            {
+                "model": judge_model,
+                "input": [
+                    {"role": "system", "content": judge_system},
+                    {"role": "user", "content": judge_user},
+                ],
+                "temperature": 0.2,
+                "max_output_tokens": 400,
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "shorts_semantic_judge",
+                        "schema": judge_schema,
+                        "strict": True,
+                    }
+                },
+                "store": False,
+            }
+        )
 
-    return Job(
-        title=title,
-        script=script,
-        description=description,
-        hashtags=hashtags,
-        pexels_query=pexels_query,
-        topic=job.topic,
-        style=job.style,
-        tone=job.tone,
-        target_seconds=job.target_seconds,
-        subtopic=job.subtopic,
+    if not ab_enabled:
+        chosen = _generate_candidate("A", "")
+        return Job(
+            title=(chosen.get("title") or "").strip(),
+            script=(chosen.get("script") or "").strip(),
+            description=(chosen.get("description") or "").strip(),
+            hashtags=(chosen.get("hashtags") or "").strip(),
+            pexels_query=(chosen.get("pexels_query") or "").strip(),
+            topic=job.topic,
+            style=job.style,
+            tone=job.tone,
+            target_seconds=job.target_seconds,
+            subtopic=job.subtopic,
+            topic_source=job.topic_source,
+            grounding_note=job.grounding_note,
+            semantic_status="ab_disabled",
+            judge_feedback=None,
+            ab_winner="A",
+        )
+
+    feedback = ""
+    last_judge: dict[str, Any] | None = None
+    for round_idx in range(semantic_retry_limit + 1):
+        candidate_a = _generate_candidate("A", feedback)
+        candidate_b = _generate_candidate("B", feedback)
+        judge = _judge_candidates(candidate_a, candidate_b)
+        last_judge = judge
+        pass_a = bool(judge.get("candidate_a_pass"))
+        pass_b = bool(judge.get("candidate_b_pass"))
+        winner = str(judge.get("winner") or "").strip().upper()
+        feedback = _one_line(
+            " | ".join(
+                part
+                for part in [
+                    str(judge.get("feedback") or "").strip(),
+                    f"A: {str(judge.get('candidate_a_reason') or '').strip()}",
+                    f"B: {str(judge.get('candidate_b_reason') or '').strip()}",
+                ]
+                if part
+            )
+        )
+
+        chosen: dict[str, Any] | None = None
+        chosen_label = ""
+        if pass_a and not pass_b:
+            chosen = candidate_a
+            chosen_label = "A"
+        elif pass_b and not pass_a:
+            chosen = candidate_b
+            chosen_label = "B"
+        elif pass_a and pass_b:
+            if winner == "B":
+                chosen = candidate_b
+                chosen_label = "B"
+            else:
+                chosen = candidate_a
+                chosen_label = "A"
+
+        if chosen is not None:
+            return Job(
+                title=(chosen.get("title") or "").strip(),
+                script=(chosen.get("script") or "").strip(),
+                description=(chosen.get("description") or "").strip(),
+                hashtags=(chosen.get("hashtags") or "").strip(),
+                pexels_query=(chosen.get("pexels_query") or "").strip(),
+                topic=job.topic,
+                style=job.style,
+                tone=job.tone,
+                target_seconds=job.target_seconds,
+                subtopic=job.subtopic,
+                topic_source=job.topic_source,
+                grounding_note=job.grounding_note,
+                semantic_status="pass",
+                judge_feedback=feedback,
+                ab_winner=chosen_label,
+            )
+
+        if round_idx < semantic_retry_limit:
+            print("[-] Semantic judge rejected both A/B scripts; regenerating once.")
+            continue
+
+    raise RuntimeError(
+        "Semantic judge rejected both A/B scripts after retry: "
+        + _one_line(str((last_judge or {}).get("feedback") or "meaning mismatch"))
     )
 
 
@@ -1681,14 +1843,14 @@ def resolve_font_for_korean(config: dict) -> tuple[str | None, str | None]:
     return None, None
 
 
-def format_title_for_titlefile(title: str) -> tuple[str, int]:
-    """Return (text_with_newlines, fontsize) for `drawtext=textfile=...`.
+def format_title_for_titlefile(title: str) -> tuple[str, int, int]:
+    """Return (text_with_newlines, fontsize, line_count) for `drawtext=textfile=...`.
 
     Using `textfile` avoids fragile escaping issues with Korean, punctuation and newlines.
     """
     clean = re.sub(r"\s+", " ", title).strip()
     if not clean:
-        return "", 72
+        return "", 72, 1
 
     def visual_len(s: str) -> float:
         # Rough: ASCII chars are narrower than Hangul/CJK on typical sans fonts.
@@ -1719,11 +1881,11 @@ def format_title_for_titlefile(title: str) -> tuple[str, int]:
     vlen = visual_len(clean)
     one = fit_fontsize(vlen, 92)
     if one >= 74:
-        return clean, one
+        return clean, one, 1
 
     tokens = [t for t in clean.split(" ") if t]
     if len(tokens) < 2:
-        return clean, one
+        return clean, one, 1
 
     # Wrap (2 lines). Choose the split that minimizes the max line length.
     best: tuple[float, str, str] | None = None  # (max_vlen, left, right)
@@ -1735,11 +1897,39 @@ def format_title_for_titlefile(title: str) -> tuple[str, int]:
             best = (m, left, right)
 
     if not best:
-        return clean, one
+        return clean, one, 1
 
     max_line, left, right = best
     two = fit_fontsize(max_line, 88)
-    return f"{left}\n{right}", two
+    return f"{left}\n{right}", two, 2
+
+
+def _estimate_title_block_height(fontsize: int, line_count: int, line_spacing: int) -> int:
+    safe_fontsize = max(1, int(fontsize))
+    safe_lines = max(1, int(line_count))
+    safe_spacing = max(0, int(line_spacing))
+    line_height = max(safe_fontsize, int(round(safe_fontsize * 1.08)))
+    block_height = (line_height * safe_lines) + (safe_spacing * max(0, safe_lines - 1))
+    return block_height + 16
+
+
+def _compute_title_y(
+    *,
+    top_h: int,
+    frame_h: int,
+    title_y_offset: int,
+    title_fontsize: int,
+    title_line_count: int,
+    title_line_spacing: int,
+    title_safe_center_y: int,
+    title_min_y: int,
+) -> int:
+    block_height = _estimate_title_block_height(title_fontsize, title_line_count, title_line_spacing)
+    safe_center = max(int(top_h * 0.70), title_safe_center_y)
+    min_allowed = max(0, title_min_y)
+    max_allowed = max(min_allowed, frame_h - block_height - 32)
+    target_y = int(round(safe_center - (block_height / 2.0))) + title_y_offset
+    return max(min_allowed, min(max_allowed, target_y))
 
 
 def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict, title_text: str) -> None:
@@ -1793,7 +1983,7 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
         fontsdir_opt = f":fontsdir='{_ffmpeg_escape(fontsdir)}'"
 
     # Use a title text file for reliable newline / unicode behavior with ffmpeg drawtext.
-    title_content, title_fontsize = format_title_for_titlefile(title_text)
+    title_content, title_fontsize, title_line_count = format_title_for_titlefile(title_text)
     title_txt = out_video.with_suffix(".title.txt")
     title_txt.write_text(title_content + "\n", encoding="utf-8")
     title_txt_safe = _ffmpeg_escape(str(title_txt))
@@ -1924,6 +2114,25 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
             f"margin_v={subs_margin_px} outline_color={subs_outline_colour} back_color={subs_back_colour}"
         )
 
+    title_line_spacing = _coerce_int(
+        config.get("title_block_line_spacing"),
+        default=10,
+        key="title_block_line_spacing",
+        min_value=0,
+    )
+    title_safe_center_y = _coerce_int(
+        config.get("title_thumbnail_safe_center_y"),
+        default=220,
+        key="title_thumbnail_safe_center_y",
+        min_value=0,
+    )
+    title_min_y = _coerce_int(
+        config.get("title_thumbnail_min_y"),
+        default=120,
+        key="title_thumbnail_min_y",
+        min_value=0,
+    )
+
     margin_min = -300 if vertical_sub_pos == "middle" else 0
     ass_margin_v = px_to_ass(subs_margin_px, min_v=margin_min)
     ass_path = out_video.with_suffix(".subs.ass")
@@ -1951,9 +2160,19 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
         f"margin_v={ass_margin_v} ass={ass_path}"
     )
 
-    # Title y position inside top bar
-    # Keep more breathing room under the top bar so notch areas don't overlap.
-    title_y = max(34, int(top_h * 0.24) + title_y_offset)
+    # Title y position inside the thumbnail-safe upper area.
+    # Shorts thumbnails crop the upper region aggressively, so anchor the full
+    # title block lower than the visual top bar.
+    title_y = _compute_title_y(
+        top_h=top_h,
+        frame_h=1920,
+        title_y_offset=title_y_offset,
+        title_fontsize=title_fontsize,
+        title_line_count=title_line_count,
+        title_line_spacing=title_line_spacing,
+        title_safe_center_y=title_safe_center_y,
+        title_min_y=title_min_y,
+    )
     ass_safe = _ffmpeg_escape(str(ass_path))
 
     vf = (
@@ -1961,7 +2180,7 @@ def render_video(bg: Path, audio: Path, srt: Path, out_video: Path, config: dict
         "eq=saturation=0.90:contrast=1.04,"
         f"drawbox=x=0:y=0:w=1080:h={top_h}:color=black@1.0:t=fill,"
         f"drawbox=x=0:y={1920 - bottom_h}:w=1080:h={bottom_h}:color=black@1.0:t=fill,"
-        f"drawtext=textfile='{title_txt_safe}'{font_opt}:reload=0:x=(w-text_w)/2:y={title_y}:fontsize={title_fontsize}:fontcolor=white:borderw=8:bordercolor=black:line_spacing=10:text_align=C:fix_bounds=1,"
+        f"drawtext=textfile='{title_txt_safe}'{font_opt}:reload=0:x=(w-text_w)/2:y={title_y}:fontsize={title_fontsize}:fontcolor=white:borderw=8:bordercolor=black:line_spacing={title_line_spacing}:text_align=C:fix_bounds=1,"
         f"ass='{ass_safe}'{fontsdir_opt},"
         f"drawbox=x=0:y=1892:w='1080*t/{duration:.3f}':h=10:color=0x00E5FF@0.9:t=fill"
     )
@@ -2452,6 +2671,11 @@ def load_job(path: Path) -> Job:
         style=data.get("style"),
         tone=data.get("tone"),
         target_seconds=data.get("target_seconds"),
+        topic_source=data.get("topic_source"),
+        grounding_note=data.get("grounding_note"),
+        semantic_status=data.get("semantic_status"),
+        judge_feedback=data.get("judge_feedback"),
+        ab_winner=data.get("ab_winner"),
     )
 
 
@@ -3144,6 +3368,14 @@ def main() -> int:
                     "job_path": str(job_path),
                     "results": {},
                 }
+                if isinstance(job.topic, str) and job.topic.strip():
+                    state_payload["topic"] = job.topic.strip()
+                if isinstance(job.subtopic, str) and job.subtopic.strip():
+                    state_payload["subtopic"] = job.subtopic.strip()
+                if isinstance(job.title, str) and job.title.strip():
+                    state_payload["title"] = job.title.strip()
+                if isinstance(job.topic_source, str) and job.topic_source.strip():
+                    state_payload["topic_source"] = job.topic_source.strip()
                 for pform, result in upload_results.items():
                     normalized: dict[str, str] = {}
                     if isinstance(result.get("video_id"), str):

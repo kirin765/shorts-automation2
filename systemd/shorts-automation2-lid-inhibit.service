@@ -1,0 +1,12 @@
+[Unit]
+Description=Prevent suspend on lid close while shorts-automation2 automation is enabled
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/systemd-inhibit --what=handle-lid-switch:sleep --who=shorts-automation2 --why=scheduled-uploads /home/k/.openclaw/workspace/tmp/shorts-automation2/scripts/lid_inhibit_idle.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

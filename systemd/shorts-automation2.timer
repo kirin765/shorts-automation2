@@ -1,0 +1,10 @@
+[Unit]
+Description=Run shorts-automation2 at 00:00, 08:00, 16:00 KST with persistent catch-up
+
+[Timer]
+OnCalendar=*-*-* 00,08,16:00:00
+Persistent=true
+Unit=shorts-automation2.service
+
+[Install]
+WantedBy=timers.target

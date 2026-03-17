@@ -20,7 +20,9 @@ def slug(s: str) -> str:
 def split_topic_and_subtopic(line: str) -> tuple[str, str]:
     raw = line.strip()
     if "\t" in raw:
-        main, subtopic = raw.split("\t", 1)
+        parts = raw.split("\t")
+        main = (parts[0] or "").strip()
+        subtopic = (parts[1] or "").strip() if len(parts) > 1 else ""
         return main.strip(), subtopic.strip()
     if " | " in raw:
         main, subtopic = raw.split(" | ", 1)
@@ -28,13 +30,22 @@ def split_topic_and_subtopic(line: str) -> tuple[str, str]:
     return raw, ""
 
 
-def read_topics(path: Path) -> list[tuple[str, str]]:
-    topics: list[tuple[str, str]] = []
+def read_topics(path: Path) -> list[dict[str, str]]:
+    topics: list[dict[str, str]] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        topics.append(split_topic_and_subtopic(line))
+        parts = [part.strip() for part in line.split("\t")]
+        topic, subtopic = split_topic_and_subtopic(line)
+        topics.append(
+            {
+                "topic": topic,
+                "subtopic": subtopic,
+                "topic_source": (parts[2] if len(parts) > 2 and parts[2] else "regular"),
+                "grounding_note": (parts[3] if len(parts) > 3 else ""),
+            }
+        )
     return topics
 
 
@@ -52,11 +63,20 @@ def main() -> int:
     ap.add_argument("--run-queue", default="scripts/run_queue.sh")
     args = ap.parse_args()
 
-    topics: list[tuple[str, str]] = []
+    topics: list[dict[str, str]] = []
     if args.topics_file:
         topics.extend(read_topics(Path(args.topics_file)))
     if args.topic:
-        topics.extend((t.strip(), "") for t in args.topic if t and t.strip())
+        topics.extend(
+            {
+                "topic": t.strip(),
+                "subtopic": "",
+                "topic_source": "regular",
+                "grounding_note": "",
+            }
+            for t in args.topic
+            if t and t.strip()
+        )
     if not topics:
         raise SystemExit("No topics. Use --topic or --topics-file.")
 
@@ -69,7 +89,9 @@ def main() -> int:
 
     created: list[Path] = []
     for i in range(n):
-        topic, subtopic = topics[i]
+        item = topics[i]
+        topic = item.get("topic", "").strip()
+        subtopic = item.get("subtopic", "").strip()
         topic_key = topic
         if not topic_key:
             continue
@@ -86,6 +108,12 @@ def main() -> int:
             payload["style"] = args.style
         if args.tone:
             payload["tone"] = args.tone
+        topic_source = item.get("topic_source", "").strip().lower()
+        if topic_source:
+            payload["topic_source"] = topic_source
+        grounding_note = item.get("grounding_note", "").strip()
+        if grounding_note:
+            payload["grounding_note"] = grounding_note
         p.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         created.append(p)
 

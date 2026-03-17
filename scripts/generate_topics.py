@@ -42,6 +42,23 @@ def _response_text(data: dict) -> str:
     raise RuntimeError("OpenAI response: no output text found")
 
 
+def _responses_json(
+    *,
+    base_url: str,
+    api_key: str,
+    timeout_s: int,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    response = requests.post(
+        f"{base_url}/responses",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=timeout_s,
+    )
+    response.raise_for_status()
+    return json.loads(_response_text(response.json()))
+
+
 def _coerce_int(value: object, *, default: int) -> int:
     try:
         return int(value)
@@ -69,6 +86,21 @@ def _coerce_list(value: object, *, default: list[str] | None = None) -> list[str
                 out.append(text)
         return out
     return default[:]
+
+
+def _coerce_bool(value: object, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 _LOW_INTEREST_MARKERS = {
@@ -288,6 +320,87 @@ def collect_trend_seeds(cfg: dict) -> list[str]:
     return out
 
 
+def _count_today_trend_uploads(cfg: dict, today: str) -> int:
+    uploads_path = Path(
+        _coerce_str(((cfg.get("youtube") or {}).get("upload_state_file")), default="logs/uploads.jsonl")
+    )
+    if not uploads_path.exists():
+        return 0
+    count = 0
+    for line in uploads_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if str(obj.get("topic_source") or "").strip().lower() != "trend":
+            continue
+        if str(obj.get("ts") or "").strip()[:10] == today:
+            count += 1
+    return count
+
+
+def ground_trend_topic(
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    timeout_s: int,
+    topic: str,
+    subtopic: str,
+    trend_seeds: list[str],
+) -> dict[str, Any]:
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "grounded": {"type": "boolean"},
+            "note": {"type": "string"},
+        },
+        "required": ["grounded", "note"],
+    }
+    trend_tail = "\n".join(f"- {t}" for t in trend_seeds[:12]) if trend_seeds else "(none)"
+    system = (
+        "You resolve the actual meaning of a trending Korean YouTube topic before script writing. "
+        "Reject topics when the noun/proper noun meaning is unclear. "
+        "Prevent semantic mistakes such as treating an unknown word like an app/SNS when it is not."
+    )
+    user = (
+        f"Topic: {topic}\n"
+        f"Subtopic: {subtopic or '(none)'}\n"
+        "Recent YouTube trend seeds:\n"
+        f"{trend_tail}\n\n"
+        "Return grounded=false if you cannot confidently explain what the main noun/proper noun means.\n"
+        "If grounded=true, note must briefly explain:\n"
+        "- what this topic/term actually refers to\n"
+        "- what it does NOT refer to\n"
+        "- 2-3 meaning anchors the script must keep\n"
+        "Keep note short, factual, and directly usable in a writing prompt."
+    )
+    return _responses_json(
+        base_url=base_url,
+        api_key=api_key,
+        timeout_s=timeout_s,
+        payload={
+            "model": model,
+            "input": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "temperature": 0.2,
+            "max_output_tokens": 240,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "trend_grounding",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+            "store": False,
+        },
+    )
+
+
 def request_topics_once(
     *,
     base_url: str,
@@ -303,14 +416,23 @@ def request_topics_once(
     request_count: int,
     avoid_topics: list[str],
     trend_seeds: list[str],
-) -> list[str]:
+    trend_quota_remaining: int,
+) -> list[dict[str, str]]:
     schema = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
             "topics": {
                 "type": "array",
-                "items": {"type": "string"},
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "topic": {"type": "string"},
+                        "topic_source": {"type": "string", "enum": ["regular", "trend"]},
+                    },
+                    "required": ["topic", "topic_source"],
+                },
                 "minItems": max(1, request_count),
                 "maxItems": max(1, request_count) + 5,
             }
@@ -338,6 +460,10 @@ def request_topics_once(
         "Prefer topics that can be explained in ~25-35 seconds.\n"
         "Prioritize strong hooks (why/why now/how to/hidden mistake). "
         "Include concrete situations, decisions, comparisons, numbers, or clear mistakes.\n"
+        f"Trend-topic quota remaining today: {max(0, trend_quota_remaining)}.\n"
+        "Set topic_source='trend' only when the topic directly depends on a current trend seed.\n"
+        "Set topic_source='regular' for evergreen or non-trend topics.\n"
+        "If trend-topic quota remaining is 0, all returned items must use topic_source='regular' and must not rely on trend seeds.\n"
         "Avoid generic placeholders or reworded duplicates like 'daily update', 'topic idea', 'news', 'misc'.\n"
         "Use these trend seeds:\n"
         f"{trend_tail}\n"
@@ -345,31 +471,38 @@ def request_topics_once(
         f"{avoid_tail if avoid_tail else '(none)'}\n"
     )
 
-    payload = {
-        "model": model,
-        "input": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        "temperature": temperature,
-        "max_output_tokens": max_tokens,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "topics",
-                "schema": schema,
-                "strict": True,
-            }
+    obj = _responses_json(
+        base_url=base_url,
+        api_key=api_key,
+        timeout_s=timeout_s,
+        payload={
+            "model": model,
+            "input": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "topics",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+            "store": False,
         },
-        "store": False,
-    }
-
-    response = requests.post(
-        f"{base_url}/responses",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=timeout_s,
     )
-    response.raise_for_status()
-    obj = json.loads(_response_text(response.json()))
-    return [t.strip() for t in (obj.get("topics") or []) if isinstance(t, str) and t.strip()]
+    out: list[dict[str, str]] = []
+    for item in (obj.get("topics") or []):
+        if not isinstance(item, dict):
+            continue
+        topic = _coerce_str(item.get("topic"))
+        if not topic:
+            continue
+        source = _coerce_str(item.get("topic_source"), default="regular").lower()
+        if source not in {"regular", "trend"}:
+            source = "regular"
+        out.append({"topic": topic, "topic_source": source})
+    return out
 
 
 def main() -> int:
@@ -416,6 +549,8 @@ def main() -> int:
     if max_attempts < 1:
         raise SystemExit(f"--max-attempts must be >= 1 (got {max_attempts})")
     trend_seeds = collect_trend_seeds(cfg)
+    trend_topic_daily_cap = max(0, _coerce_int(cfg.get("trend_topic_daily_cap", 1), default=1))
+    trend_grounding_enabled = _coerce_bool(cfg.get("trend_grounding_enabled"), default=True)
     niche = _coerce_str(
         args.niche,
         default=_coerce_str(cfg.get("topic_niche_default"), default="테크/AI/인터넷 트렌드"),
@@ -435,14 +570,15 @@ def main() -> int:
     hist_path.parent.mkdir(parents=True, exist_ok=True)
 
     existing = read_existing_topics(hist_path)
-    accepted: list[str] = []
+    accepted: list[dict[str, str]] = []
     accepted_set: set[str] = {_normalize_topic_key(t) for t in existing}
-    all_candidates: list[str] = []
+    all_candidates: list[dict[str, str]] = []
     today = date.today().isoformat()
+    trend_quota_remaining = max(0, trend_topic_daily_cap - _count_today_trend_uploads(cfg, today))
 
     print(
         f"[topics] policy mode={uniqueness_mode} target_count={args.count} max_attempts={max_attempts} "
-        f"history_size={len(existing)} trend_seeds={len(trend_seeds)} style={style}"
+        f"history_size={len(existing)} trend_seeds={len(trend_seeds)} style={style} trend_quota_remaining={trend_quota_remaining}"
     )
 
     for attempt in range(1, max_attempts + 1):
@@ -467,6 +603,7 @@ def main() -> int:
                 request_count=request_count,
                 avoid_topics=avoid_topics,
                 trend_seeds=trend_seeds,
+                trend_quota_remaining=trend_quota_remaining,
             )
         except Exception as e:
             raise SystemExit(f"topic generation failed on attempt {attempt}/{max_attempts}: {e}") from e
@@ -475,26 +612,58 @@ def main() -> int:
             print(f"[topics] attempt {attempt}/{max_attempts}: no topics returned")
             continue
 
-        high_interest_batch: list[str] = []
-        for raw in batch:
+        high_interest_batch: list[dict[str, str]] = []
+        for item in batch:
+            raw = _coerce_str(item.get("topic"))
+            source = _coerce_str(item.get("topic_source"), default="regular").lower()
             t = raw.strip()
             if not t:
                 continue
             if "\t" not in t and " | " in t:
                 t = t.replace(" | ", "\t", 1)
-            high_interest_batch.append(t)
-        high_interest_batch = [t for t in high_interest_batch if _is_high_interest_topic(t)]
+            if not _is_high_interest_topic(t):
+                continue
+            high_interest_batch.append({"topic": t, "topic_source": source if source in {"regular", "trend"} else "regular"})
         all_candidates.extend(high_interest_batch)
         added_this_attempt = 0
-        for topic in high_interest_batch:
-            key = _normalize_topic_key(topic)
+        for item in high_interest_batch:
+            topic_line = item["topic"]
+            key = _normalize_topic_key(topic_line)
             if not key or key in accepted_set:
                 continue
             if uniqueness_mode == "strict" and key in {_normalize_topic_key(t) for t in existing}:
                 continue
+            source = item.get("topic_source", "regular")
+            if source == "trend" and trend_quota_remaining <= 0:
+                continue
+            topic_main, topic_sub = _split_topic_and_subtopic(topic_line)
+            grounding_note = ""
+            if source == "trend" and trend_grounding_enabled:
+                grounding = ground_trend_topic(
+                    base_url=base_url,
+                    api_key=api_key,
+                    model=(cfg.get("openai_judge_model") or cfg.get("openai_topic_model") or cfg.get("openai_model") or "gpt-4o-mini").strip(),
+                    timeout_s=timeout_s,
+                    topic=topic_main,
+                    subtopic=topic_sub,
+                    trend_seeds=trend_seeds,
+                )
+                if not bool(grounding.get("grounded")):
+                    print(f"[topics] grounding rejected trend topic: {topic_main}")
+                    continue
+                grounding_note = _coerce_str(grounding.get("note"))
             accepted_set.add(key)
-            accepted.append(topic)
+            accepted.append(
+                {
+                    "topic": topic_main,
+                    "subtopic": topic_sub,
+                    "topic_source": source,
+                    "grounding_note": grounding_note,
+                }
+            )
             added_this_attempt += 1
+            if source == "trend":
+                trend_quota_remaining -= 1
             if len(accepted) >= args.count:
                 break
 
@@ -504,12 +673,26 @@ def main() -> int:
         )
 
     if len(accepted) < args.count and uniqueness_mode == "best_effort":
-        for topic in all_candidates:
-            key = _normalize_topic_key(topic)
+        for item in all_candidates:
+            topic_line = item["topic"]
+            key = _normalize_topic_key(topic_line)
             if not key or key in accepted_set:
                 continue
+            source = item.get("topic_source", "regular")
+            if source == "trend" and trend_quota_remaining <= 0:
+                continue
+            topic_main, topic_sub = _split_topic_and_subtopic(topic_line)
             accepted_set.add(key)
-            accepted.append(topic)
+            accepted.append(
+                {
+                    "topic": topic_main,
+                    "subtopic": topic_sub,
+                    "topic_source": source,
+                    "grounding_note": "",
+                }
+            )
+            if source == "trend":
+                trend_quota_remaining -= 1
             if len(accepted) >= args.count:
                 break
         print(f"[topics] best_effort fallback accepted={len(accepted)}/{args.count}")
@@ -522,10 +705,24 @@ def main() -> int:
         )
 
     final_topics = accepted[: args.count]
-    out_path.write_text("\n".join(final_topics) + "\n", encoding="utf-8")
+    out_lines = [
+        "\t".join(
+            [
+                item.get("topic", "").strip(),
+                item.get("subtopic", "").strip(),
+                item.get("topic_source", "regular").strip() or "regular",
+                (item.get("grounding_note", "") or "").replace("\n", " ").strip(),
+            ]
+        ).rstrip("\t")
+        for item in final_topics
+    ]
+    out_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
     with hist_path.open("a", encoding="utf-8") as f:
-        for topic in final_topics:
-            f.write(topic + "\n")
+        for item in final_topics:
+            history_line = item.get("topic", "").strip()
+            if item.get("subtopic"):
+                history_line = f"{history_line}\t{item['subtopic'].strip()}"
+            f.write(history_line + "\n")
 
     print(f"Wrote {len(final_topics)} topics to {out_path}")
     return 0

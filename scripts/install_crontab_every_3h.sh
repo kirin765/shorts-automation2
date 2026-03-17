@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Install a cron job that runs every 3 hours.
+# Install a cron job that runs every 8 hours (00:00 / 08:00 / 16:00).
 # Usage:
 #   ./scripts/install_crontab_every_3h.sh [minute]
 # minute default: 0
@@ -19,13 +19,12 @@ CMD="LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 PYTHONIOENCODING=utf-8 cd $ROOT_DIR && 
 
 tmp="$(mktemp)"
 crontab -l 2>/dev/null | grep -v "run_scheduled.sh" > "$tmp" || true
-LINE="$MINUTE */3 * * * $CMD"
+LINE="$MINUTE 0,8,16 * * * $CMD"
 echo "Installing crontab line:"
 echo "$LINE"
 echo "$LINE" >> "$tmp"
 crontab "$tmp"
 rm -f "$tmp"
 
-echo "Installed every-3-hour cron rule (minute=$MINUTE)."
-echo "To make minute configurable, edit CMD/line or add a custom minute in the schedule."
+echo "Installed 8-hour cron rule for 00:00/08:00/16:00 (minute=$MINUTE)."
 echo "Installed. Verify with: crontab -l"

@@ -1,0 +1,9 @@
+[Unit]
+Description=shorts-automation2 scheduled upload run
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/k/.openclaw/workspace/tmp/shorts-automation2
+ExecStart=/home/k/.openclaw/workspace/tmp/shorts-automation2/scripts/run_scheduled_systemd.sh
