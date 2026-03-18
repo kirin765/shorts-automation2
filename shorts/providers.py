@@ -2,15 +2,31 @@ from __future__ import annotations
 
 import json
 import textwrap
-from datetime import date
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import requests
 
+from . import prompts
 from .captions import fmt_time, split_for_captions, split_for_captions_dense
 from .config import Config
-from .models import DraftJob, RenderJob
+from .models import DraftJob, ReviewedPackage, RenderJob, ScriptPackage, SelectedTopic, TopicCandidate, TopicPool, TopicScores
+
+
+@dataclass
+class ReviewFeedback:
+    approved: bool
+    selected_title: str
+    description: str
+    hashtags: str
+    retention_score: int
+    novelty_score: int
+    risk_flags: list[str]
+    fact_check_points: list[str]
+    review_notes: list[str]
+    rewrite_instructions: list[str]
 
 
 def openai_api_key(config: Config) -> str:
@@ -22,6 +38,266 @@ def openai_api_key(config: Config) -> str:
     return key
 
 
+def generate_topic_pool(
+    config: Config,
+    *,
+    run_id: str,
+    count: int,
+    existing_topics: Optional[Iterable[str]] = None,
+) -> TopicPool:
+    key = openai_api_key(config)
+    existing = [item.strip() for item in (existing_topics or []) if item and item.strip()]
+    system, user, schema = prompts.build_topic_pool_prompt(config, count=count, existing_topics=existing)
+    payload = _responses_payload(
+        model=config.content.openai_topic_model or config.content.openai_model,
+        system=system,
+        user=user,
+        schema_name="topic_pool",
+        schema=schema,
+        temperature=config.content.openai_topic_temperature,
+        max_output_tokens=config.content.openai_topic_max_output_tokens,
+    )
+    data = _responses_request(config, key, payload)
+    obj = _decode_output_json(data)
+    seen = set()
+    existing_set = set(existing)
+    candidates = []
+    for index, raw in enumerate(obj.get("candidates") or [], start=1):
+        if not isinstance(raw, dict):
+            continue
+        payload_item = dict(raw)
+        payload_item["candidate_id"] = str(payload_item.get("candidate_id") or "candidate_%02d" % index).strip() or "candidate_%02d" % index
+        candidate = TopicCandidate.from_dict(payload_item)
+        topic_key = candidate.topic.strip()
+        if topic_key in seen or topic_key in existing_set:
+            continue
+        seen.add(topic_key)
+        candidates.append(candidate)
+        if len(candidates) >= count:
+            break
+    if not candidates:
+        raise RuntimeError("topic generation returned no usable candidates")
+    return TopicPool(
+        run_id=run_id,
+        channel_category=config.content.channel_category,
+        series_name=config.content.series_name,
+        generated_at=datetime.now().isoformat(timespec="seconds"),
+        candidates=candidates,
+    )
+
+
+def evaluate_topic_pool(config: Config, topic_pool: TopicPool, *, select_count: int) -> list[SelectedTopic]:
+    key = openai_api_key(config)
+    system, user, schema = prompts.build_topic_evaluation_prompt(config, candidates=topic_pool.candidates)
+    payload = _responses_payload(
+        model=config.content.openai_topic_model or config.content.openai_model,
+        system=system,
+        user=user,
+        schema_name="topic_evaluations",
+        schema=schema,
+        temperature=config.content.openai_topic_temperature,
+        max_output_tokens=config.content.openai_topic_max_output_tokens,
+    )
+    data = _responses_request(config, key, payload)
+    obj = _decode_output_json(data)
+    candidates_by_id = {item.candidate_id: item for item in topic_pool.candidates}
+    selected = []
+    for raw in obj.get("evaluations") or []:
+        if not isinstance(raw, dict):
+            continue
+        candidate_id = str(raw.get("candidate_id") or "").strip()
+        candidate = candidates_by_id.get(candidate_id)
+        if not candidate:
+            continue
+        scores = TopicScores.from_dict(
+            {
+                "clarity": raw.get("clarity"),
+                "hook_strength": raw.get("hook_strength"),
+                "retention_potential": raw.get("retention_potential"),
+                "twist_potential": raw.get("twist_potential"),
+                "series_fit": raw.get("series_fit"),
+                "repetition_risk": raw.get("repetition_risk"),
+                "monetization_safety": raw.get("monetization_safety"),
+            }
+        )
+        if not scores.passes_thresholds():
+            continue
+        selected.append(
+            SelectedTopic(
+                run_id=topic_pool.run_id,
+                candidate_id=candidate.candidate_id,
+                rank=0,
+                series_name=candidate.series_name,
+                topic=candidate.topic,
+                angle=candidate.angle,
+                target_emotion=candidate.target_emotion,
+                scores=scores,
+                overall_score=scores.overall_score(),
+                selection_reason=str(raw.get("selection_reason") or "selected").strip() or "selected",
+            )
+        )
+    selected.sort(key=lambda item: item.overall_score, reverse=True)
+    for index, item in enumerate(selected, start=1):
+        item.rank = index
+    chosen = selected[: max(1, select_count)]
+    if not chosen:
+        raise RuntimeError("topic evaluation produced no candidates above threshold")
+    return chosen
+
+
+def manual_selected_topic(config: Config, *, run_id: str, topic: str) -> SelectedTopic:
+    cleaned = topic.strip()
+    if not cleaned:
+        raise ValueError("manual topic must be non-empty")
+    baseline = TopicScores(
+        clarity=10,
+        hook_strength=10,
+        retention_potential=10,
+        twist_potential=8,
+        series_fit=10,
+        repetition_risk=1,
+        monetization_safety=10,
+    )
+    return SelectedTopic(
+        run_id=run_id,
+        candidate_id="manual_01",
+        rank=1,
+        series_name=config.content.series_name,
+        topic=cleaned,
+        angle="이 주제를 왜 지금 봐야 하는지 설명한다",
+        target_emotion="curiosity",
+        scores=baseline,
+        overall_score=baseline.overall_score(),
+        selection_reason="manual topic",
+    )
+
+
+def generate_script_package(config: Config, selected_topic: SelectedTopic) -> ScriptPackage:
+    key = openai_api_key(config)
+    system, user, schema = prompts.build_script_package_prompt(config, topic_payload=selected_topic.to_dict())
+    payload = _responses_payload(
+        model=config.content.openai_model,
+        system=system,
+        user=user,
+        schema_name="script_package",
+        schema=schema,
+        temperature=config.content.openai_temperature,
+        max_output_tokens=config.content.openai_max_output_tokens,
+    )
+    data = _responses_request(config, key, payload)
+    obj = _decode_output_json(data)
+    return ScriptPackage.from_dict(
+        {
+            "run_id": selected_topic.run_id,
+            "candidate_id": selected_topic.candidate_id,
+            "series_name": selected_topic.series_name,
+            "topic": selected_topic.topic,
+            "angle": selected_topic.angle,
+            "target_emotion": selected_topic.target_emotion,
+            **obj,
+        }
+    )
+
+
+def review_script_package(config: Config, script_package: ScriptPackage) -> ReviewFeedback:
+    key = openai_api_key(config)
+    system, user, schema = prompts.build_script_review_prompt(config, script_package=script_package)
+    payload = _responses_payload(
+        model=config.content.openai_model,
+        system=system,
+        user=user,
+        schema_name="script_review",
+        schema=schema,
+        temperature=config.content.openai_temperature,
+        max_output_tokens=config.content.openai_max_output_tokens,
+    )
+    data = _responses_request(config, key, payload)
+    obj = _decode_output_json(data)
+    return _review_feedback_from_dict(obj)
+
+
+def rewrite_script_package(config: Config, script_package: ScriptPackage, review_feedback: ReviewFeedback) -> ScriptPackage:
+    key = openai_api_key(config)
+    system, user, schema = prompts.build_script_rewrite_prompt(
+        config,
+        script_package=script_package,
+        rewrite_instructions=review_feedback.rewrite_instructions,
+    )
+    payload = _responses_payload(
+        model=config.content.openai_model,
+        system=system,
+        user=user,
+        schema_name="script_package_rewrite",
+        schema=schema,
+        temperature=config.content.openai_temperature,
+        max_output_tokens=config.content.openai_max_output_tokens,
+    )
+    data = _responses_request(config, key, payload)
+    obj = _decode_output_json(data)
+    return ScriptPackage.from_dict(
+        {
+            "run_id": script_package.run_id,
+            "candidate_id": script_package.candidate_id,
+            "series_name": script_package.series_name,
+            "topic": script_package.topic,
+            "angle": script_package.angle,
+            "target_emotion": script_package.target_emotion,
+            **obj,
+        }
+    )
+
+
+def review_passes(config: Config, script_package: ScriptPackage, review_feedback: ReviewFeedback) -> bool:
+    if not review_feedback.approved:
+        return False
+    if script_package.duration_sec < 20 or script_package.duration_sec > 35:
+        return False
+    if review_feedback.retention_score < config.content.review_min_retention_score:
+        return False
+    if review_feedback.novelty_score < config.content.review_min_novelty_score:
+        return False
+    if any(item.strip() for item in review_feedback.risk_flags):
+        return False
+    return True
+
+
+def build_reviewed_package(
+    config: Config,
+    script_package: ScriptPackage,
+    review_feedback: ReviewFeedback,
+    *,
+    rewrite_applied: bool,
+) -> ReviewedPackage:
+    if not review_passes(config, script_package, review_feedback):
+        raise RuntimeError("review did not pass thresholds")
+    hashtags = _normalize_hashtags(review_feedback.hashtags)
+    return ReviewedPackage.from_dict(
+        {
+            **script_package.to_dict(),
+            "selected_title": review_feedback.selected_title,
+            "description": review_feedback.description,
+            "hashtags": hashtags,
+            "review_notes": review_feedback.review_notes,
+            "rewrite_applied": rewrite_applied,
+            "retention_score": review_feedback.retention_score,
+            "novelty_score": review_feedback.novelty_score,
+            "risk_flags": review_feedback.risk_flags,
+            "fact_check_points": review_feedback.fact_check_points,
+        }
+    )
+
+
+def package_render_job(reviewed_package: ReviewedPackage) -> RenderJob:
+    script_parts = [reviewed_package.best_hook] + reviewed_package.script_lines + [reviewed_package.ending]
+    return RenderJob(
+        title=reviewed_package.selected_title,
+        script="\n".join(item.strip() for item in script_parts if item and item.strip()),
+        description=reviewed_package.description,
+        hashtags=_normalize_hashtags(reviewed_package.hashtags),
+        pexels_query=reviewed_package.pexels_query,
+    )
+
+
 def generate_topics(
     config: Config,
     *,
@@ -31,129 +307,27 @@ def generate_topics(
     style: str,
     existing_topics: Optional[Iterable[str]] = None,
 ) -> list[str]:
-    key = openai_api_key(config)
-    existing = [item.strip() for item in (existing_topics or []) if item and item.strip()]
-    existing_tail = "\n".join("- %s" % item for item in existing[-80:]) or "(none)"
-    schema = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "topics": {
-                "type": "array",
-                "items": {"type": "string"},
-                "minItems": max(1, count),
-                "maxItems": max(1, count) + 5,
-            }
-        },
-        "required": ["topics"],
-    }
-    system = (
-        "You generate high-retention YouTube Shorts topic ideas. "
-        "Do not include emojis. Do not include hashtags. "
-        "Avoid precise claims that need fact-checking. "
-        "Output only valid JSON matching the schema."
+    _ = language, niche, style
+    pool = generate_topic_pool(
+        config,
+        run_id="legacy-topics",
+        count=count,
+        existing_topics=existing_topics,
     )
-    user = (
-        "Language: %s\n"
-        "Niche: %s\n"
-        "Style: %s\n"
-        "Date: %s\n"
-        "Generate %d topics. Each topic should be one line, <= 35 characters if Korean.\n"
-        "Prefer topics that can be explained in ~25-35 seconds.\n"
-        "Avoid repeating these recent topics if possible:\n"
-        "%s\n"
-    ) % (language, niche, style, date.today().isoformat(), count, existing_tail)
-    payload = _responses_payload(
-        model=config.content.openai_topic_model or config.content.openai_model,
-        system=system,
-        user=user,
-        schema_name="topics",
-        schema=schema,
-        temperature=config.content.openai_topic_temperature,
-        max_output_tokens=config.content.openai_topic_max_output_tokens,
-    )
-    data = _responses_request(config, key, payload)
-    obj = _decode_output_json(data)
-    topics = [item.strip() for item in obj.get("topics") or [] if isinstance(item, str) and item.strip()]
-
-    seen = set()
-    filtered = []
-    existing_set = set(existing)
-    for topic in topics:
-        if topic in seen:
-            continue
-        seen.add(topic)
-        if topic in existing_set:
-            continue
-        filtered.append(topic)
-        if len(filtered) >= count:
-            break
-
-    if len(filtered) < max(1, count // 2):
-        filtered = (filtered or topics)[:count]
-    return filtered
+    return [item.topic for item in pool.candidates[:count]]
 
 
 def generate_render_job(config: Config, draft_job: DraftJob) -> RenderJob:
-    key = openai_api_key(config)
-    target_seconds = draft_job.target_seconds or config.app.shorts_target_seconds
-    system = (
-        "You write high-retention YouTube Shorts scripts (Korean). "
-        "Do not invent precise statistics, dates, prices, quotes, or named sources. "
-        "If you need numbers, use vague ranges or omit them. "
-        "Keep sentences short and punchy. "
-        "Output must be valid JSON matching the provided schema."
-    )
-    user = (
-        "Language: %s\n"
-        "Topic: %s\n"
-        "Style: %s\n"
-        "Tone: %s\n"
-        "Target duration: about %d seconds of narration.\n"
-        "Output rules:\n"
-        "- title: <= 28 chars, curiosity-driven, no clickbait lies.\n"
-        "- script: 5-7 sentences total. First sentence must be the hook.\n"
-        "- script: avoid long clauses; prefer short lines that are easy to subtitle.\n"
-        "- description: 1-2 sentences summary.\n"
-        "- hashtags: 3-5 tags including #shorts.\n"
-        "- pexels_query: 4-8 English words, no brand names.\n"
-    ) % (
-        config.content.openai_language or config.app.default_language,
-        draft_job.topic,
-        draft_job.style or "tech news / explain like I am busy",
-        draft_job.tone or "confident, concise",
-        target_seconds,
-    )
-    schema = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "title": {"type": "string"},
-            "script": {"type": "string"},
-            "description": {"type": "string"},
-            "hashtags": {"type": "string"},
-            "pexels_query": {"type": "string"},
-        },
-        "required": ["title", "script", "description", "hashtags", "pexels_query"],
-    }
-    payload = _responses_payload(
-        model=config.content.openai_model,
-        system=system,
-        user=user,
-        schema_name="render_job",
-        schema=schema,
-        temperature=config.content.openai_temperature,
-        max_output_tokens=config.content.openai_max_output_tokens,
-    )
-    data = _responses_request(config, key, payload)
-    obj = _decode_output_json(data)
-    return RenderJob(
-        title=str(obj["title"]).strip(),
-        script=str(obj["script"]).strip(),
-        description=str(obj["description"]).strip(),
-        hashtags=str(obj["hashtags"]).strip(),
-        pexels_query=str(obj["pexels_query"]).strip() or None,
-    )
+    selected = manual_selected_topic(config, run_id="legacy-render", topic=draft_job.topic)
+    package = generate_script_package(config, selected)
+    feedback = review_script_package(config, package)
+    rewrite_applied = False
+    if not review_passes(config, package, feedback):
+        package = rewrite_script_package(config, package, feedback)
+        feedback = review_script_package(config, package)
+        rewrite_applied = True
+    reviewed = build_reviewed_package(config, package, feedback, rewrite_applied=rewrite_applied)
+    return package_render_job(reviewed)
 
 
 def write_srt_aligned_openai(
@@ -296,6 +470,59 @@ def write_srt_aligned_openai(
     for index, ((start, end), text) in enumerate(zip(windows, transcript_lines), start=1):
         add_block(index, start, end, text)
     srt_path.write_text("\n".join(blocks), encoding="utf-8")
+
+
+def _normalize_hashtags(hashtags: str) -> str:
+    cleaned = " ".join(part for part in hashtags.split() if part.strip())
+    lowered = {part.lower() for part in cleaned.split()}
+    if "#shorts" not in lowered:
+        cleaned = "#shorts " + cleaned if cleaned else "#shorts"
+    return cleaned.strip()
+
+
+def _review_feedback_from_dict(data: dict[str, Any]) -> ReviewFeedback:
+    approved = bool(data.get("approved"))
+    selected_title = str(data.get("selected_title") or "").strip()
+    description = str(data.get("description") or "").strip()
+    hashtags = str(data.get("hashtags") or "").strip()
+    retention_score = int(data.get("retention_score") or 0)
+    novelty_score = int(data.get("novelty_score") or 0)
+    risk_flags = _clean_text_list(data.get("risk_flags"))
+    fact_check_points = _clean_text_list(data.get("fact_check_points"))
+    review_notes = _clean_text_list(data.get("review_notes"))
+    rewrite_instructions = _clean_text_list(data.get("rewrite_instructions"))
+    if not selected_title:
+        raise RuntimeError("review response missing selected_title")
+    if not description:
+        raise RuntimeError("review response missing description")
+    if not hashtags:
+        raise RuntimeError("review response missing hashtags")
+    if retention_score < 1 or retention_score > 10:
+        raise RuntimeError("review response retention_score must be 1-10")
+    if novelty_score < 1 or novelty_score > 10:
+        raise RuntimeError("review response novelty_score must be 1-10")
+    return ReviewFeedback(
+        approved=approved,
+        selected_title=selected_title,
+        description=description,
+        hashtags=hashtags,
+        retention_score=retention_score,
+        novelty_score=novelty_score,
+        risk_flags=risk_flags,
+        fact_check_points=fact_check_points,
+        review_notes=review_notes,
+        rewrite_instructions=rewrite_instructions,
+    )
+
+
+def _clean_text_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip())
+    return out
 
 
 def _responses_payload(

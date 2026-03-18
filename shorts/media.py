@@ -573,6 +573,86 @@ def _ffmpeg_escape(text: str) -> str:
     )
 
 
+def _srt_timestamp_to_ass(value: str) -> str:
+    hours, minutes, rest = value.split(":")
+    seconds, millis = rest.split(",")
+    centis = int(round(int(millis) / 10.0))
+    if centis >= 100:
+        centis = 99
+    return "%d:%02d:%02d.%02d" % (int(hours), int(minutes), int(seconds), centis)
+
+
+def _ass_escape_text(text: str) -> str:
+    escaped = text.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
+    return escaped.replace("\n", r"\N")
+
+
+def _build_ass_from_srt(
+    srt_path: Path,
+    ass_path: Path,
+    *,
+    playres_y: int,
+    font_name: str,
+    font_size: int,
+    outline: int,
+    alignment: int,
+    margin_v: int,
+    margin_lr: int,
+) -> None:
+    raw = srt_path.read_text(encoding="utf-8", errors="ignore").strip()
+    blocks = re.split(r"\n\s*\n", raw, flags=re.M) if raw else []
+    events = []
+    timing_pattern = re.compile(
+        r"^(?P<start>\d\d:\d\d:\d\d,\d\d\d)\s*-->\s*(?P<end>\d\d:\d\d:\d\d,\d\d\d)\s*$"
+    )
+
+    for block in blocks:
+        lines = [line.rstrip("\r") for line in block.splitlines() if line.strip()]
+        if len(lines) < 2:
+            continue
+        timing_line = lines[1] if "-->" in lines[1] else lines[0]
+        match = timing_pattern.match(timing_line.strip())
+        if not match:
+            continue
+        text_lines = lines[2:] if "-->" in lines[1] else lines[1:]
+        text = _ass_escape_text("\n".join(text_lines).strip())
+        if not text:
+            continue
+        events.append(
+            "Dialogue: 0,%s,%s,Default,,0,0,0,,%s"
+            % (
+                _srt_timestamp_to_ass(match.group("start")),
+                _srt_timestamp_to_ass(match.group("end")),
+                text,
+            )
+        )
+
+    ass_text = "\n".join(
+        [
+            "[Script Info]",
+            "ScriptType: v4.00+",
+            "PlayResX: 1080",
+            "PlayResY: %d" % playres_y,
+            "WrapStyle: 2",
+            "ScaledBorderAndShadow: yes",
+            "",
+            "[V4+ Styles]",
+            "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,"
+            "Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
+            "Alignment,MarginL,MarginR,MarginV,Encoding",
+            "Style: Default,%s,%d,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+            "0,0,0,0,100,100,0,0,1,%d,0,%d,%d,%d,%d,1"
+            % (font_name, font_size, outline, alignment, margin_lr, margin_lr, margin_v),
+            "",
+            "[Events]",
+            "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
+            *events,
+            "",
+        ]
+    )
+    ass_path.write_text(ass_text, encoding="utf-8")
+
+
 def resolve_font_for_korean(config: Config) -> tuple[Optional[str], Optional[str]]:
     def fc_match(query: str) -> tuple[Optional[str], Optional[str]]:
         try:
@@ -706,6 +786,7 @@ def render_video(config: Config, job: RenderJob, bg: Path, audio: Path, srt: Pat
     title_txt = out_video.with_suffix(".title.txt")
     title_txt.write_text(title_content + "\n", encoding="utf-8")
     title_txt_safe = _ffmpeg_escape(str(title_txt))
+    ass_subs = out_video.with_suffix(".subs.ass")
 
     playres_y = config.render.subtitle_playres_y
 
@@ -760,6 +841,18 @@ def render_video(config: Config, job: RenderJob, bg: Path, audio: Path, srt: Pat
             px_to_ass(subtitle_margin_px, minimum=margin_min),
         )
     )
+    _build_ass_from_srt(
+        srt,
+        ass_subs,
+        playres_y=playres_y,
+        font_name=subtitle_font_name,
+        font_size=px_to_ass(subtitle_font_size),
+        outline=px_to_ass(subtitle_outline),
+        alignment=subtitle_alignment,
+        margin_v=px_to_ass(subtitle_margin_px, minimum=margin_min),
+        margin_lr=px_to_ass(64),
+    )
+    ass_safe = _ffmpeg_escape(str(ass_subs))
     title_y = max(34, int(config.render.top_bar_height * 0.16))
     vf = (
         "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
@@ -768,7 +861,7 @@ def render_video(config: Config, job: RenderJob, bg: Path, audio: Path, srt: Pat
         "drawbox=x=0:y=%d:w=1080:h=%d:color=black@1.0:t=fill,"
         "drawtext=textfile='%s'%s:reload=0:x=(w-text_w)/2:y=%d:fontsize=%d:"
         "fontcolor=white:borderw=8:bordercolor=black:line_spacing=10:text_align=C:fix_bounds=1,"
-        "subtitles='%s'%s:force_style='%s',"
+        "subtitles='%s'%s,"
         "drawbox=x=0:y=1892:w='1080*t/%.3f':h=10:color=0x00E5FF@0.9:t=fill"
         % (
             config.render.top_bar_height,
@@ -778,9 +871,8 @@ def render_video(config: Config, job: RenderJob, bg: Path, audio: Path, srt: Pat
             font_opt,
             title_y,
             title_fontsize,
-            srt_safe,
+            ass_safe,
             fontsdir_opt,
-            subtitle_style,
             duration,
         )
     )

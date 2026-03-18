@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 try:
     from dotenv import load_dotenv
-except Exception:  # pragma: no cover - optional dependency already in requirements
+except Exception:
     load_dotenv = None
 
 
@@ -27,6 +27,7 @@ DEFAULT_CONFIG = {
         "queue_dir": "jobs/queue",
         "done_dir": "jobs/done",
         "failed_dir": "jobs/failed",
+        "work_dir": "jobs/work",
         "topics_file": "jobs/topics.txt",
         "topics_history_file": "jobs/topics_history.txt",
         "ffmpeg_bin": "",
@@ -39,13 +40,25 @@ DEFAULT_CONFIG = {
         "openai_base_url": "https://api.openai.com/v1",
         "openai_timeout_s": 40,
         "openai_temperature": 0.7,
-        "openai_max_output_tokens": 650,
+        "openai_max_output_tokens": 900,
         "openai_topic_temperature": 0.7,
-        "openai_topic_max_output_tokens": 500,
+        "openai_topic_max_output_tokens": 700,
         "openai_language": "ko",
         "openai_transcribe_model": "whisper-1",
         "openai_transcribe_timeout_s": 60,
         "openai_transcribe_language": "ko",
+        "channel_category": "테크/AI/인터넷 트렌드",
+        "series_name": "AI 현상 해설",
+        "series_brief": "복잡한 인터넷/AI 현상을 20-35초 안에 차분하게 설명하는 쇼츠 시리즈",
+        "series_audience": "바쁜 직장인과 일반 시청자",
+        "series_constraints": [
+            "한 줄에 한 가지 정보만 넣는다",
+            "첫 문장은 바로 훅이어야 한다",
+            "정확한 수치나 날짜는 확신이 없으면 쓰지 않는다"
+        ],
+        "topic_pool_size": 8,
+        "review_min_retention_score": 7,
+        "review_min_novelty_score": 6,
     },
     "tts": {
         "provider": "edge",
@@ -134,6 +147,7 @@ class AppConfig:
     queue_dir: str
     done_dir: str
     failed_dir: str
+    work_dir: str
     topics_file: str
     topics_history_file: str
     ffmpeg_bin: str
@@ -155,6 +169,14 @@ class ContentConfig:
     openai_transcribe_model: str
     openai_transcribe_timeout_s: int
     openai_transcribe_language: str
+    channel_category: str
+    series_name: str
+    series_brief: str
+    series_audience: str
+    series_constraints: list[str]
+    topic_pool_size: int
+    review_min_retention_score: int
+    review_min_novelty_score: int
 
 
 @dataclass(frozen=True)
@@ -364,6 +386,7 @@ def _build_config(data: dict[str, Any]) -> Config:
             queue_dir=_expect_str(app, "queue_dir", "app"),
             done_dir=_expect_str(app, "done_dir", "app"),
             failed_dir=_expect_str(app, "failed_dir", "app"),
+            work_dir=_expect_str(app, "work_dir", "app"),
             topics_file=_expect_str(app, "topics_file", "app"),
             topics_history_file=_expect_str(app, "topics_history_file", "app"),
             ffmpeg_bin=_expect_str(app, "ffmpeg_bin", "app"),
@@ -383,6 +406,14 @@ def _build_config(data: dict[str, Any]) -> Config:
             openai_transcribe_model=_expect_str(content, "openai_transcribe_model", "content"),
             openai_transcribe_timeout_s=_expect_int(content, "openai_transcribe_timeout_s", "content", minimum=1),
             openai_transcribe_language=_expect_str(content, "openai_transcribe_language", "content"),
+            channel_category=_expect_str(content, "channel_category", "content"),
+            series_name=_expect_str(content, "series_name", "content"),
+            series_brief=_expect_str(content, "series_brief", "content"),
+            series_audience=_expect_str(content, "series_audience", "content"),
+            series_constraints=_expect_str_list(content, "series_constraints", "content"),
+            topic_pool_size=_expect_int(content, "topic_pool_size", "content", minimum=1),
+            review_min_retention_score=_expect_int(content, "review_min_retention_score", "content", minimum=1),
+            review_min_novelty_score=_expect_int(content, "review_min_novelty_score", "content", minimum=1),
         ),
         tts=TTSConfig(
             provider=_expect_str(tts, "provider", "tts"),
@@ -466,6 +497,18 @@ def _expect_str(data: dict[str, Any], key: str, section: str) -> str:
     if not isinstance(value, str):
         raise ValueError("config %s.%s must be a string" % (section, key))
     return value
+
+
+def _expect_str_list(data: dict[str, Any], key: str, section: str) -> list[str]:
+    value = data.get(key)
+    if not isinstance(value, list):
+        raise ValueError("config %s.%s must be a list of strings" % (section, key))
+    out = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError("config %s.%s must be a list of strings" % (section, key))
+        out.append(item)
+    return out
 
 
 def _expect_int(data: dict[str, Any], key: str, section: str, minimum: Optional[int] = None) -> int:

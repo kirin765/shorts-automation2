@@ -4,65 +4,123 @@ import argparse
 import shutil
 import sys
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
 from . import providers, runner
 from .config import ENV_SENTINEL, Config, load_config
-from .models import DraftJob, RenderJob, load_draft_job, load_topics_text, make_draft_jobs, slugify, write_render_job
+from .models import (
+    append_topics_text,
+    load_reviewed_package,
+    load_script_package,
+    load_selected_topic,
+    load_topic_pool,
+    load_topics_text,
+    slugify,
+    write_render_job,
+    write_reviewed_package,
+    write_script_package,
+    write_selected_topic,
+    write_topic_pool,
+)
 from .output import one_line
 
 
-def generate_topics_to_file(
+def generate_topic_pool_to_file(
     config: Config,
     *,
     out_path: Path,
     history_path: Path,
     count: int,
-    language: str,
-    niche: str,
-    style: str,
-) -> list[str]:
-    existing = []
-    if history_path.exists():
-        existing = load_topics_text(history_path)
-    topics = providers.generate_topics(
+    run_id: str,
+) -> Path:
+    existing = load_topics_text(history_path) if history_path.exists() else []
+    topic_pool = providers.generate_topic_pool(
         config,
+        run_id=run_id,
         count=count,
-        language=language,
-        niche=niche,
-        style=style,
         existing_topics=existing,
     )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    history_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\n".join(topics) + "\n", encoding="utf-8")
-    with history_path.open("a", encoding="utf-8") as handle:
-        for topic in topics:
-            handle.write(topic + "\n")
-    print("Wrote %d topics to %s" % (len(topics), out_path))
-    return topics
+    write_topic_pool(out_path, topic_pool)
+    return out_path
 
 
-def draft_jobs_to_queue(
+def evaluate_topic_pool_to_files(
     config: Config,
     *,
-    draft_jobs: list[DraftJob],
-    queue_dir: Path,
+    topic_pool_path: Path,
+    out_dir: Path,
+    count: int,
 ) -> list[Path]:
+    topic_pool = load_topic_pool(topic_pool_path)
+    selected_topics = providers.evaluate_topic_pool(config, topic_pool, select_count=count)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for item in selected_topics:
+        path = out_dir / ("selected_topic_%02d.json" % item.rank)
+        write_selected_topic(path, item)
+        paths.append(path)
+    return paths
+
+
+def generate_script_package_to_file(
+    config: Config,
+    *,
+    selected_topic_path: Optional[Path],
+    topic: Optional[str],
+    out_path: Path,
+    run_id: str,
+) -> Path:
+    if selected_topic_path is not None:
+        selected_topic = load_selected_topic(selected_topic_path)
+    else:
+        selected_topic = providers.manual_selected_topic(config, run_id=run_id, topic=topic or "")
+    script_package = providers.generate_script_package(config, selected_topic)
+    write_script_package(out_path, script_package)
+    return out_path
+
+
+def review_script_package_to_file(
+    config: Config,
+    *,
+    script_package_path: Path,
+    out_path: Path,
+) -> Path:
+    script_package = load_script_package(script_package_path)
+    review_feedback = providers.review_script_package(config, script_package)
+    rewrite_applied = False
+    if not providers.review_passes(config, script_package, review_feedback):
+        script_package = providers.rewrite_script_package(config, script_package, review_feedback)
+        review_feedback = providers.review_script_package(config, script_package)
+        rewrite_applied = True
+    if not providers.review_passes(config, script_package, review_feedback):
+        detail = "; ".join(review_feedback.review_notes or review_feedback.risk_flags or review_feedback.rewrite_instructions or ["review failed"])
+        raise RuntimeError("script review failed after rewrite: %s" % one_line(detail))
+    reviewed = providers.build_reviewed_package(
+        config,
+        script_package,
+        review_feedback,
+        rewrite_applied=rewrite_applied,
+    )
+    write_reviewed_package(out_path, reviewed)
+    return out_path
+
+
+def package_reviewed_job_to_queue(
+    config: Config,
+    *,
+    reviewed_package_path: Path,
+    queue_dir: Path,
+) -> Path:
+    reviewed = load_reviewed_package(reviewed_package_path)
+    render_job = providers.package_render_job(reviewed)
     queue_dir.mkdir(parents=True, exist_ok=True)
-    today = date.today().strftime("%Y-%m-%d")
-    created = []
-    for index, draft_job in enumerate(draft_jobs, start=1):
-        render_job = providers.generate_render_job(config, draft_job)
-        path = queue_dir / ("%s_%s_%02d.json" % (today, slugify(draft_job.topic)[:40], index))
-        write_render_job(path, render_job)
-        created.append(path)
-    print("Enqueued:")
-    for path in created:
-        print("- %s" % path)
-    return created
+    stamp = date.today().strftime("%Y-%m-%d")
+    suffix = _path_index_suffix(reviewed_package_path)
+    path = queue_dir / ("%s_%s_%s.json" % (stamp, slugify(reviewed.topic)[:40], suffix))
+    write_render_job(path, render_job)
+    return path
 
 
 def run_queue(
@@ -135,30 +193,51 @@ def build_parser() -> argparse.ArgumentParser:
     topics_parser = subparsers.add_parser("topics")
     topics_subparsers = topics_parser.add_subparsers(dest="topics_command")
     topics_subparsers.required = True
+
     topics_generate = topics_subparsers.add_parser("generate")
     topics_generate.add_argument("--config", default=ENV_SENTINEL)
     topics_generate.add_argument("--out")
     topics_generate.add_argument("--history")
-    topics_generate.add_argument("--count", type=int, default=10)
-    topics_generate.add_argument("--language")
-    topics_generate.add_argument("--niche", default="테크/AI/인터넷 트렌드")
-    topics_generate.add_argument("--style", default="테크 뉴스, 한 문장 짧게")
+    topics_generate.add_argument("--work-dir")
+    topics_generate.add_argument("--run-id")
+    topics_generate.add_argument("--count", type=int, default=8)
     topics_generate.set_defaults(func=_cmd_topics_generate)
+
+    topics_evaluate = topics_subparsers.add_parser("evaluate")
+    topics_evaluate.add_argument("--config", default=ENV_SENTINEL)
+    topics_evaluate.add_argument("--topic-pool", required=True)
+    topics_evaluate.add_argument("--out-dir")
+    topics_evaluate.add_argument("--count", type=int, default=1)
+    topics_evaluate.set_defaults(func=_cmd_topics_evaluate)
+
+    scripts_parser = subparsers.add_parser("scripts")
+    scripts_subparsers = scripts_parser.add_subparsers(dest="scripts_command")
+    scripts_subparsers.required = True
+
+    scripts_generate = scripts_subparsers.add_parser("generate")
+    scripts_generate.add_argument("--config", default=ENV_SENTINEL)
+    scripts_generate.add_argument("--selected-topic")
+    scripts_generate.add_argument("--topic")
+    scripts_generate.add_argument("--out")
+    scripts_generate.add_argument("--work-dir")
+    scripts_generate.add_argument("--run-id")
+    scripts_generate.set_defaults(func=_cmd_scripts_generate)
+
+    scripts_review = scripts_subparsers.add_parser("review")
+    scripts_review.add_argument("--config", default=ENV_SENTINEL)
+    scripts_review.add_argument("--script-package", required=True)
+    scripts_review.add_argument("--out")
+    scripts_review.set_defaults(func=_cmd_scripts_review)
 
     jobs_parser = subparsers.add_parser("jobs")
     jobs_subparsers = jobs_parser.add_subparsers(dest="jobs_command")
     jobs_subparsers.required = True
-    jobs_draft = jobs_subparsers.add_parser("draft")
-    jobs_draft.add_argument("--config", default=ENV_SENTINEL)
-    jobs_draft.add_argument("--queue-dir")
-    jobs_draft.add_argument("--draft-job", action="append")
-    jobs_draft.add_argument("--topics-file")
-    jobs_draft.add_argument("--topic", action="append")
-    jobs_draft.add_argument("--count", type=int, default=1)
-    jobs_draft.add_argument("--target-seconds", type=int)
-    jobs_draft.add_argument("--style")
-    jobs_draft.add_argument("--tone")
-    jobs_draft.set_defaults(func=_cmd_jobs_draft)
+
+    jobs_package = jobs_subparsers.add_parser("package")
+    jobs_package.add_argument("--config", default=ENV_SENTINEL)
+    jobs_package.add_argument("--reviewed-package", required=True)
+    jobs_package.add_argument("--queue-dir")
+    jobs_package.set_defaults(func=_cmd_jobs_package)
 
     render_parser = subparsers.add_parser("render")
     render_parser.add_argument("--config", default=ENV_SENTINEL)
@@ -188,17 +267,12 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline_subparsers.required = True
     pipeline_daily = pipeline_subparsers.add_parser("daily")
     pipeline_daily.add_argument("--config", default=ENV_SENTINEL)
-    pipeline_daily.add_argument("--topics-file")
+    pipeline_daily.add_argument("--work-dir")
     pipeline_daily.add_argument("--history-file")
     pipeline_daily.add_argument("--queue-dir")
     pipeline_daily.add_argument("--done-dir")
     pipeline_daily.add_argument("--failed-dir")
     pipeline_daily.add_argument("--count", type=int, default=1)
-    pipeline_daily.add_argument("--target-seconds", type=int)
-    pipeline_daily.add_argument("--style", default="테크 뉴스, 한 문장 짧게")
-    pipeline_daily.add_argument("--tone", default="빠르고 자신있게")
-    pipeline_daily.add_argument("--niche", default="테크/AI/인터넷 트렌드")
-    pipeline_daily.add_argument("--language")
     pipeline_daily.add_argument("--no-upload", action="store_true")
     pipeline_daily.add_argument("--force-upload", action="store_true")
     pipeline_daily.set_defaults(func=_cmd_pipeline_daily)
@@ -213,35 +287,90 @@ def main(argv: Optional[list[str]] = None) -> int:
     except Exception as exc:
         if getattr(args, "traceback", False):
             raise
+        command = "%s.%s" % (getattr(args, "command", "unknown"), getattr(args, "%s_command" % getattr(args, "command", ""), "") or "run")
         print("ERROR %s: %s" % (type(exc).__name__, one_line(str(exc))), file=sys.stderr)
+        print("RESULT status=error command=%s error=%s" % (command, one_line(str(exc))), file=sys.stderr)
         return 1
 
 
 def _cmd_topics_generate(args: argparse.Namespace) -> int:
     config = load_config(args.config)
-    out_path = Path(args.out or config.app.topics_file)
+    run_id = args.run_id or _new_run_id()
+    out_path = Path(args.out) if args.out else _default_run_dir(config, args.work_dir, run_id) / "topic_pool.json"
     history_path = Path(args.history or config.app.topics_history_file)
-    language = args.language or config.content.openai_language or config.app.default_language
-    generate_topics_to_file(
+    generate_topic_pool_to_file(
         config,
         out_path=out_path,
         history_path=history_path,
-        count=args.count,
-        language=language,
-        niche=args.niche,
-        style=args.style,
+        count=max(1, args.count),
+        run_id=run_id,
     )
+    print("Wrote topic pool: %s" % out_path)
+    print("RESULT status=ok command=topics.generate output=%s" % one_line(str(out_path)))
     return 0
 
 
-def _cmd_jobs_draft(args: argparse.Namespace) -> int:
+def _cmd_topics_evaluate(args: argparse.Namespace) -> int:
     config = load_config(args.config)
-    draft_jobs = _collect_draft_jobs(args, config)
-    if not draft_jobs:
-        raise ValueError("No draft jobs. Use --draft-job, --topic, or --topics-file.")
-    count = min(max(1, args.count), len(draft_jobs))
+    topic_pool_path = Path(args.topic_pool)
+    out_dir = Path(args.out_dir) if args.out_dir else topic_pool_path.parent
+    paths = evaluate_topic_pool_to_files(
+        config,
+        topic_pool_path=topic_pool_path,
+        out_dir=out_dir,
+        count=max(1, args.count),
+    )
+    print("Selected topics:")
+    for path in paths:
+        print("- %s" % path)
+    print("RESULT status=ok command=topics.evaluate count=%d" % len(paths))
+    return 0
+
+
+def _cmd_scripts_generate(args: argparse.Namespace) -> int:
+    if bool(args.selected_topic) == bool(args.topic):
+        raise ValueError("Use exactly one of --selected-topic or --topic.")
+    config = load_config(args.config)
+    run_id = args.run_id or _new_run_id()
+    if args.out:
+        out_path = Path(args.out)
+    elif args.selected_topic:
+        selected_path = Path(args.selected_topic)
+        out_path = selected_path.with_name("script_package_%s.json" % _path_index_suffix(selected_path))
+    else:
+        out_path = _default_run_dir(config, args.work_dir, run_id) / "script_package_01.json"
+    generate_script_package_to_file(
+        config,
+        selected_topic_path=Path(args.selected_topic) if args.selected_topic else None,
+        topic=args.topic,
+        out_path=out_path,
+        run_id=run_id,
+    )
+    print("Wrote script package: %s" % out_path)
+    print("RESULT status=ok command=scripts.generate output=%s" % one_line(str(out_path)))
+    return 0
+
+
+def _cmd_scripts_review(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    script_package_path = Path(args.script_package)
+    out_path = Path(args.out) if args.out else script_package_path.with_name("reviewed_package_%s.json" % _path_index_suffix(script_package_path))
+    review_script_package_to_file(config, script_package_path=script_package_path, out_path=out_path)
+    print("Wrote reviewed package: %s" % out_path)
+    print("RESULT status=ok command=scripts.review output=%s" % one_line(str(out_path)))
+    return 0
+
+
+def _cmd_jobs_package(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
     queue_dir = Path(args.queue_dir or config.app.queue_dir)
-    draft_jobs_to_queue(config, draft_jobs=draft_jobs[:count], queue_dir=queue_dir)
+    path = package_reviewed_job_to_queue(
+        config,
+        reviewed_package_path=Path(args.reviewed_package),
+        queue_dir=queue_dir,
+    )
+    print("Enqueued: %s" % path)
+    print("RESULT status=ok command=jobs.package output=%s" % one_line(str(path)))
     return 0
 
 
@@ -274,29 +403,53 @@ def _cmd_queue_run(args: argparse.Namespace) -> int:
 
 def _cmd_pipeline_daily(args: argparse.Namespace) -> int:
     config = load_config(args.config)
-    topics_file = Path(args.topics_file or config.app.topics_file)
+    run_id = _new_run_id()
+    run_dir = _default_run_dir(config, args.work_dir, run_id)
     history_file = Path(args.history_file or config.app.topics_history_file)
     queue_dir = Path(args.queue_dir or config.app.queue_dir)
     done_dir = Path(args.done_dir or config.app.done_dir)
     failed_dir = Path(args.failed_dir or config.app.failed_dir)
-    language = args.language or config.content.openai_language or config.app.default_language
+    count = max(1, args.count)
+    pool_path = run_dir / "topic_pool.json"
+    selected_topics = []
 
-    topics = generate_topics_to_file(
+    generate_topic_pool_to_file(
         config,
-        out_path=topics_file,
+        out_path=pool_path,
         history_path=history_file,
-        count=args.count,
-        language=language,
-        niche=args.niche,
-        style=args.style,
+        count=max(config.content.topic_pool_size, count * 4),
+        run_id=run_id,
     )
-    draft_jobs = make_draft_jobs(
-        topics=topics,
-        style=args.style,
-        tone=args.tone,
-        target_seconds=args.target_seconds or config.app.shorts_target_seconds,
+    selected_paths = evaluate_topic_pool_to_files(
+        config,
+        topic_pool_path=pool_path,
+        out_dir=run_dir,
+        count=count,
     )
-    draft_jobs_to_queue(config, draft_jobs=draft_jobs, queue_dir=queue_dir)
+
+    for index, selected_path in enumerate(selected_paths, start=1):
+        script_path = run_dir / ("script_package_%02d.json" % index)
+        reviewed_path = run_dir / ("reviewed_package_%02d.json" % index)
+        generate_script_package_to_file(
+            config,
+            selected_topic_path=selected_path,
+            topic=None,
+            out_path=script_path,
+            run_id=run_id,
+        )
+        review_script_package_to_file(
+            config,
+            script_package_path=script_path,
+            out_path=reviewed_path,
+        )
+        package_reviewed_job_to_queue(
+            config,
+            reviewed_package_path=reviewed_path,
+            queue_dir=queue_dir,
+        )
+        selected_topics.append(load_reviewed_package(reviewed_path).topic)
+
+    append_topics_text(history_file, selected_topics)
     return run_queue(
         config,
         queue_dir=queue_dir,
@@ -309,31 +462,14 @@ def _cmd_pipeline_daily(args: argparse.Namespace) -> int:
     )
 
 
-def _collect_draft_jobs(args: argparse.Namespace, config: Config) -> list[DraftJob]:
-    draft_jobs = []
-    for path in args.draft_job or []:
-        draft = load_draft_job(Path(path))
-        draft_jobs.append(
-            DraftJob(
-                topic=draft.topic,
-                style=args.style or draft.style,
-                tone=args.tone or draft.tone,
-                target_seconds=args.target_seconds or draft.target_seconds,
-            )
-        )
+def _default_run_dir(config: Config, work_dir_override: Optional[str], run_id: str) -> Path:
+    return Path(work_dir_override or config.app.work_dir) / run_id
 
-    topics = []
-    if args.topics_file:
-        topics.extend(load_topics_text(Path(args.topics_file)))
-    if args.topic:
-        topics.extend([item for item in args.topic if item and item.strip()])
-    if topics:
-        draft_jobs.extend(
-            make_draft_jobs(
-                topics=topics,
-                style=args.style,
-                tone=args.tone,
-                target_seconds=args.target_seconds or config.app.shorts_target_seconds,
-            )
-        )
-    return draft_jobs
+
+def _new_run_id() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _path_index_suffix(path: Path) -> str:
+    digits = "".join(ch for ch in path.stem if ch.isdigit())
+    return digits[-2:] if digits else "01"

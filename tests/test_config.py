@@ -14,15 +14,17 @@ class TestConfig(unittest.TestCase):
         with mock.patch.dict(
             "os.environ",
             {
-                "APP__DEFAULT_LANGUAGE": "en",
+                "APP__WORK_DIR": "jobs/custom-work",
                 "RENDER__SUBTITLE_FONT_SIZE": "99",
+                "CONTENT__SERIES_CONSTRAINTS": "[\"짧게 쓴다\", \"첫 문장은 훅\"]",
                 "OPENAI_API_KEY": "abc123",
             },
             clear=False,
         ):
             config = load_config("ENV")
-        self.assertEqual(config.app.default_language, "en")
+        self.assertEqual(config.app.work_dir, "jobs/custom-work")
         self.assertEqual(config.render.subtitle_font_size, 99)
+        self.assertEqual(config.content.series_constraints, ["짧게 쓴다", "첫 문장은 훅"])
         self.assertEqual(config.content.openai_api_key, "abc123")
 
     def test_unknown_key_in_file_raises(self) -> None:
@@ -38,14 +40,15 @@ class TestConfig(unittest.TestCase):
             path.write_text(
                 json.dumps(
                     {
-                        "app": {"output_dir": "custom-output"},
-                        "tts": {"provider": "gtts"},
+                        "app": {"work_dir": "jobs/custom-work"},
+                        "content": {"series_name": "새 시리즈", "topic_pool_size": 12},
                         "youtube": {"privacy_status": "unlisted"},
                     }
                 ),
                 encoding="utf-8",
             )
             config = load_config(str(path))
-        self.assertEqual(config.app.output_dir, "custom-output")
-        self.assertEqual(config.tts.provider, "gtts")
+        self.assertEqual(config.app.work_dir, "jobs/custom-work")
+        self.assertEqual(config.content.series_name, "새 시리즈")
+        self.assertEqual(config.content.topic_pool_size, 12)
         self.assertEqual(config.youtube.privacy_status, "unlisted")

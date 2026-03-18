@@ -1,6 +1,6 @@
 # YouTube Shorts 자동화
 
-단일 진입점은 `python -m shorts` 입니다. 예전 `run_short.py` 및 운영 셸 스크립트는 제거되었습니다.
+단일 진입점은 `python -m shorts` 입니다. 생성 파이프라인은 `주제 생성 -> 주제 평가 -> 스크립트 생성 -> 리뷰/재작성 -> 패키징 -> 렌더/큐 실행`으로 바뀌었습니다.
 
 ## 1) 설치
 
@@ -30,55 +30,74 @@ pip install -r requirements.txt
 예:
 
 ```bash
-APP__DEFAULT_LANGUAGE=ko RENDER__SUBTITLE_FONT_SIZE=96 python -m shorts render --config ENV --job jobs/today.json --no-upload
+APP__DEFAULT_LANGUAGE=ko CONTENT__SERIES_NAME="AI 현상 해설" python -m shorts topics generate --config ENV --count 8
 ```
 
-## 3) 잡 스키마
+## 3) 내부 아티팩트와 큐
 
-`DraftJob`:
+생성 단계 산출물은 기본적으로 `jobs/work/<run_id>/` 아래에 저장됩니다.
 
-```json
-{
-  "topic": "AI.com 도메인이 다시 주목받는 이유",
-  "style": "테크 뉴스",
-  "tone": "빠르고 자신있게",
-  "target_seconds": 28
-}
-```
+- `topic_pool.json`
+- `selected_topic_01.json`
+- `script_package_01.json`
+- `reviewed_package_01.json`
 
-`RenderJob`:
+`queue run`과 `render`는 계속 최종 `RenderJob`만 처리합니다.
+
+`RenderJob` 예시:
 
 ```json
 {
   "title": "AI.com이 다시 뜨는 이유",
-  "script": "첫 문장 훅. 이어서 5~7문장.",
+  "script": "첫 문장 훅\n둘째 줄\n셋째 줄\n마지막 줄",
   "description": "영상 설명",
   "hashtags": "#shorts #AI #tech",
   "pexels_query": "artificial intelligence abstract technology"
 }
 ```
 
-`queue run`은 `RenderJob`만 처리합니다.
-
 ## 4) 명령
 
-토픽 생성:
+토픽 풀 생성:
 
 ```bash
-python -m shorts topics generate --config ENV --count 10
+python -m shorts topics generate --config ENV --count 8
 ```
 
-토픽/드래프트를 렌더 잡으로 변환:
+토픽 평가 및 선택:
 
 ```bash
-python -m shorts jobs draft --config ENV --topic "AI.com 도메인이 다시 주목받는 이유"
-python -m shorts jobs draft --config ENV --topics-file jobs/topics.txt --count 3
+python -m shorts topics evaluate --config ENV --topic-pool jobs/work/20260318_090000/topic_pool.json --count 1
+```
+
+선택된 토픽으로 스크립트 초안 생성:
+
+```bash
+python -m shorts scripts generate --config ENV --selected-topic jobs/work/20260318_090000/selected_topic_01.json
+```
+
+수동 토픽으로 바로 스크립트 생성:
+
+```bash
+python -m shorts scripts generate --config ENV --topic "AI.com 도메인이 다시 주목받는 이유"
+```
+
+스크립트 리뷰 및 1회 자동 재작성:
+
+```bash
+python -m shorts scripts review --config ENV --script-package jobs/work/20260318_090000/script_package_01.json
+```
+
+리뷰 통과본을 큐용 렌더 잡으로 패키징:
+
+```bash
+python -m shorts jobs package --config ENV --reviewed-package jobs/work/20260318_090000/reviewed_package_01.json
 ```
 
 단일 렌더:
 
 ```bash
-python -m shorts render --config ENV --job jobs/today.json --no-upload
+python -m shorts render --config ENV --job jobs/queue/2026-03-18_ai-com_01.json --no-upload
 ```
 
 큐 실행:
@@ -95,9 +114,9 @@ python -m shorts pipeline daily --config ENV --count 1 --no-upload
 
 ## 5) 출력 계약
 
-- 성공/실패와 무관하게 단일 행 `SUMMARY {...}` 출력
-- 성공/실패와 무관하게 단일 행 `RESULT ...` 출력
-- 기본 동작은 traceback 비노출
+- `render`와 `queue run`은 단일 행 `RESULT ...`를 유지합니다.
+- 생성 단계 명령도 성공 시 단일 행 `RESULT status=ok ...`를 출력합니다.
+- 실패 시 traceback 대신 `ERROR ...`와 `RESULT status=error ...`를 출력합니다.
 - `render --traceback`으로만 traceback 출력
 
 ## 6) 산출물
@@ -114,6 +133,7 @@ python -m shorts pipeline daily --config ENV --count 1 --no-upload
 - `jobs/queue`
 - `jobs/done`
 - `jobs/failed`
+- `jobs/work`
 
 ## 7) 스케줄링
 

@@ -8,6 +8,7 @@
     "queue_dir": "jobs/queue",
     "done_dir": "jobs/done",
     "failed_dir": "jobs/failed",
+    "work_dir": "jobs/work",
     "topics_file": "jobs/topics.txt",
     "topics_history_file": "jobs/topics_history.txt",
     "ffmpeg_bin": "",
@@ -20,13 +21,25 @@
     "openai_base_url": "https://api.openai.com/v1",
     "openai_timeout_s": 40,
     "openai_temperature": 0.7,
-    "openai_max_output_tokens": 650,
+    "openai_max_output_tokens": 900,
     "openai_topic_temperature": 0.7,
-    "openai_topic_max_output_tokens": 500,
+    "openai_topic_max_output_tokens": 700,
     "openai_language": "ko",
     "openai_transcribe_model": "whisper-1",
     "openai_transcribe_timeout_s": 60,
-    "openai_transcribe_language": "ko"
+    "openai_transcribe_language": "ko",
+    "channel_category": "테크/AI/인터넷 트렌드",
+    "series_name": "AI 현상 해설",
+    "series_brief": "복잡한 인터넷/AI 현상을 20-35초 안에 차분하게 설명하는 쇼츠 시리즈",
+    "series_audience": "바쁜 직장인과 일반 시청자",
+    "series_constraints": [
+      "한 줄에 한 가지 정보만 넣는다",
+      "첫 문장은 바로 훅이어야 한다",
+      "정확한 수치나 날짜는 확신이 없으면 쓰지 않는다"
+    ],
+    "topic_pool_size": 8,
+    "review_min_retention_score": 7,
+    "review_min_novelty_score": 6
   },
   "tts": {
     "provider": "edge",
