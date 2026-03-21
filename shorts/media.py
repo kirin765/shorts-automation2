@@ -853,7 +853,7 @@ def render_video(config: Config, job: RenderJob, bg: Path, audio: Path, srt: Pat
         margin_lr=64,
     )
     ass_safe = _ffmpeg_escape(str(ass_subs))
-    title_y = max(72, int(config.render.top_bar_height * 0.38))
+    title_y = max(108, int(config.render.top_bar_height * 0.56))
     vf = (
         "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
         "eq=saturation=0.90:contrast=1.04,"
