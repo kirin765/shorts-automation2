@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import parse_qs, urlparse
 
 from .config import Config
 from .models import RenderJob
@@ -13,25 +15,179 @@ from .output import one_line
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
+def youtube_authenticate(
+    config: Config,
+    *,
+    authorization_response: Optional[str] = None,
+    force: bool = False,
+    input_fn: Callable[[str], str] = input,
+    print_fn: Callable[[str], None] = print,
+) -> tuple[Path, str]:
+    client_secret_file = Path(config.youtube.client_secret_file)
+    token_file = Path(config.youtube.token_file)
+    _client_config, redirect_uri = _load_installed_client_config(client_secret_file)
 
-def get_youtube_client(client_secret_file: Path, token_file: Path):
-    from google.auth.transport.requests import Request
-    from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
+    creds = _load_credentials(token_file)
+    if creds and not force:
+        if getattr(creds, "valid", False):
+            return token_file, "existing"
+        if getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
+            try:
+                _refresh_credentials(creds)
+                _save_credentials(token_file, creds)
+                return token_file, "refreshed"
+            except Exception:
+                pass
+
+    flow, auth_url, expected_state = _build_manual_flow(client_secret_file, redirect_uri)
+    if authorization_response is None:
+        print_fn("Open this URL in a browser on another device:")
+        print_fn(auth_url)
+        print_fn("After Google redirects to localhost, copy the full http://localhost... URL from the browser address bar and paste it here.")
+        authorization_response = input_fn("Authorization response URL: ").strip()
+    else:
+        authorization_response = authorization_response.strip()
+
+    if not authorization_response:
+        raise RuntimeError("authorization response URL is required")
+
+    _validate_authorization_response(authorization_response, redirect_uri=redirect_uri, expected_state=expected_state)
+    original_insecure_transport = os.environ.get("OAUTHLIB_INSECURE_TRANSPORT")
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+    try:
+        flow.fetch_token(authorization_response=authorization_response)
+    finally:
+        if original_insecure_transport is None:
+            os.environ.pop("OAUTHLIB_INSECURE_TRANSPORT", None)
+        else:
+            os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = original_insecure_transport
+    creds = flow.credentials
+    _save_credentials(token_file, creds)
+    return token_file, "created"
+
+
+def get_youtube_client(config: Config):
     from googleapiclient.discovery import build
 
-    creds = None
-    if token_file.exists():
-        creds = Credentials.from_authorized_user_file(str(token_file), SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+    client_secret_file = Path(config.youtube.client_secret_file)
+    token_file = Path(config.youtube.token_file)
+    _load_installed_client_config(client_secret_file)
+
+    creds = _load_credentials(token_file)
+    if creds is None:
+        raise _auth_required_error(token_file)
+
+    if not getattr(creds, "valid", False):
+        if getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
+            try:
+                _refresh_credentials(creds)
+                _save_credentials(token_file, creds)
+            except Exception as exc:
+                raise _auth_required_error(token_file, extra="%s: %s" % (type(exc).__name__, one_line(str(exc)))) from exc
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_file), SCOPES)
-            creds = flow.run_local_server(port=0)
-        token_file.parent.mkdir(parents=True, exist_ok=True)
-        token_file.write_text(creds.to_json(), encoding="utf-8")
+            raise _auth_required_error(token_file)
+
     return build("youtube", "v3", credentials=creds)
+
+
+def _auth_required_error(token_file: Path, *, extra: str = "") -> RuntimeError:
+    message = (
+        "YouTube authentication required. Run `python -m shorts youtube auth --config ENV` "
+        "to create or refresh %s." % token_file
+    )
+    if extra:
+        message = "%s %s" % (message, extra)
+    return RuntimeError(message)
+
+
+def _load_installed_client_config(client_secret_file: Path) -> tuple[dict[str, Any], str]:
+    if not client_secret_file.exists():
+        raise FileNotFoundError("YouTube client secret file not found: %s" % client_secret_file)
+    try:
+        payload = json.loads(client_secret_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("YouTube client secret file is not valid JSON: %s" % exc) from exc
+    if not isinstance(payload, dict) or "installed" not in payload or not isinstance(payload["installed"], dict):
+        raise RuntimeError("YouTube client secret file must use an installed OAuth client.")
+    redirect_uris = payload["installed"].get("redirect_uris")
+    if not isinstance(redirect_uris, list) or not redirect_uris:
+        raise RuntimeError("YouTube client secret file is missing installed.redirect_uris.")
+    redirect_uri = ""
+    for candidate in redirect_uris:
+        if not isinstance(candidate, str):
+            continue
+        parsed = urlparse(candidate.strip())
+        if parsed.scheme == "http" and parsed.hostname == "localhost":
+            redirect_uri = candidate.strip()
+            break
+    if not redirect_uri:
+        raise RuntimeError("YouTube client secret file must include an http://localhost redirect URI.")
+    return payload, redirect_uri
+
+
+def _build_manual_flow(client_secret_file: Path, redirect_uri: str):
+    from google_auth_oauthlib.flow import InstalledAppFlow
+
+    flow = InstalledAppFlow.from_client_secrets_file(
+        str(client_secret_file),
+        SCOPES,
+        redirect_uri=redirect_uri,
+    )
+    auth_url, expected_state = flow.authorization_url(access_type="offline", prompt="consent")
+    return flow, auth_url, expected_state
+
+
+def _validate_authorization_response(
+    authorization_response: str,
+    *,
+    redirect_uri: str,
+    expected_state: str,
+) -> None:
+    parsed = urlparse(authorization_response)
+    expected = urlparse(redirect_uri)
+    if parsed.scheme != expected.scheme or parsed.hostname != expected.hostname:
+        raise RuntimeError("authorization response must start with %s" % redirect_uri)
+    if (parsed.path or "/") != (expected.path or "/"):
+        raise RuntimeError("authorization response path does not match redirect URI")
+    query = parse_qs(parsed.query or "")
+    code = (query.get("code") or [""])[0].strip()
+    state = (query.get("state") or [""])[0].strip()
+    if not code:
+        raise RuntimeError("authorization response is missing code")
+    if not state:
+        raise RuntimeError("authorization response is missing state")
+    if state != expected_state:
+        raise RuntimeError("authorization response state mismatch")
+
+
+def _load_credentials(token_file: Path):
+    if not token_file.exists():
+        return None
+    from google.oauth2.credentials import Credentials
+
+    try:
+        return Credentials.from_authorized_user_file(str(token_file), SCOPES)
+    except Exception as exc:
+        raise RuntimeError("Could not read YouTube token file %s: %s" % (token_file, one_line(str(exc)))) from exc
+
+
+def _refresh_credentials(creds: Any) -> None:
+    from google.auth.transport.requests import Request
+
+    creds.refresh(Request())
+
+
+def _save_credentials(token_file: Path, creds: Any) -> None:
+    token_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(token_file.parent, 0o700)
+    except Exception:
+        pass
+    token_file.write_text(creds.to_json(), encoding="utf-8")
+    try:
+        os.chmod(token_file, 0o600)
+    except Exception:
+        pass
 
 
 def retry_upload_next_chunk(
@@ -86,12 +242,15 @@ def retry_upload_next_chunk(
             backoff_s = min(backoff_s * 2.0, float(max_backoff_s))
 
 
+_retry_upload_next_chunk = retry_upload_next_chunk
+
+
 def upload_video(config: Config, job: RenderJob, video_path: Path, *, credit_line: Optional[str] = None) -> str:
     from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaFileUpload
 
     youtube = config.youtube
-    client = get_youtube_client(Path(youtube.client_secret_file), Path(youtube.token_file))
+    client = get_youtube_client(config)
     description = (job.description + "\n\n" + job.hashtags).strip()
     if credit_line and config.background.append_credit_to_description:
         description = (description + "\n\n" + credit_line).strip()
@@ -262,13 +421,13 @@ def validate_upload_checklist(
     height = as_float(video_stream.get("height"))
     if width is None or height is None or width <= 0 or height <= 0:
         raise RuntimeError("upload checklist failed: invalid video resolution")
+    if config.youtube.require_portrait and not (height > width):
+        raise RuntimeError("upload checklist failed: not portrait (got %dx%d)" % (int(width), int(height)))
     if int(width) < config.youtube.min_width or int(height) < config.youtube.min_height:
         raise RuntimeError(
             "upload checklist failed: resolution %dx%d below %dx%d"
             % (int(width), int(height), config.youtube.min_width, config.youtube.min_height)
         )
-    if config.youtube.require_portrait and not (height > width):
-        raise RuntimeError("upload checklist failed: not portrait (got %dx%d)" % (int(width), int(height)))
     if config.youtube.require_aspect_9_16:
         aspect = float(width) / float(height)
         target = 9.0 / 16.0

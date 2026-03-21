@@ -633,7 +633,7 @@ def _build_ass_from_srt(
             "ScriptType: v4.00+",
             "PlayResX: 1080",
             "PlayResY: %d" % playres_y,
-            "WrapStyle: 2",
+            "WrapStyle: 0",
             "ScaledBorderAndShadow: yes",
             "",
             "[V4+ Styles]",
@@ -850,10 +850,10 @@ def render_video(config: Config, job: RenderJob, bg: Path, audio: Path, srt: Pat
         outline=px_to_ass(subtitle_outline),
         alignment=subtitle_alignment,
         margin_v=px_to_ass(subtitle_margin_px, minimum=margin_min),
-        margin_lr=px_to_ass(64),
+        margin_lr=64,
     )
     ass_safe = _ffmpeg_escape(str(ass_subs))
-    title_y = max(34, int(config.render.top_bar_height * 0.16))
+    title_y = max(72, int(config.render.top_bar_height * 0.38))
     vf = (
         "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
         "eq=saturation=0.90:contrast=1.04,"

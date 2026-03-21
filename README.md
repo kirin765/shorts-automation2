@@ -33,6 +33,12 @@ pip install -r requirements.txt
 APP__DEFAULT_LANGUAGE=ko CONTENT__SERIES_NAME="AI 현상 해설" python -m shorts topics generate --config ENV --count 8
 ```
 
+YouTube 업로드를 쓸 경우:
+
+- `secrets/client_secret.json`은 `installed` OAuth client여야 합니다.
+- Ubuntu SSH 환경에서는 토큰을 서버에서 직접 만듭니다.
+- 로컬 브라우저를 자동으로 띄우지 않습니다.
+
 ## 3) 내부 아티팩트와 큐
 
 생성 단계 산출물은 기본적으로 `jobs/work/<run_id>/` 아래에 저장됩니다.
@@ -94,6 +100,18 @@ python -m shorts scripts review --config ENV --script-package jobs/work/20260318
 python -m shorts jobs package --config ENV --reviewed-package jobs/work/20260318_090000/reviewed_package_01.json
 ```
 
+Ubuntu SSH에서 YouTube token 발급:
+
+```bash
+python -m shorts youtube auth --config ENV
+```
+
+비대화식으로 redirect URL 전달:
+
+```bash
+python -m shorts youtube auth --config ENV --authorization-response 'http://localhost/?state=...&code=...'
+```
+
 단일 렌더:
 
 ```bash
@@ -112,14 +130,32 @@ python -m shorts queue run --config ENV --queue-dir jobs/queue --no-upload
 python -m shorts pipeline daily --config ENV --count 1 --no-upload
 ```
 
-## 5) 출력 계약
+## 5) Ubuntu SSH에서 YouTube 인증
+
+YouTube 업로드는 `secrets/token.json`이 먼저 있어야 합니다.
+
+절차:
+
+1. Ubuntu 서버에 SSH 접속
+2. `python -m shorts youtube auth --config ENV` 실행
+3. 터미널에 출력된 Google 인증 URL을 브라우저 가능한 다른 기기에서 열기
+4. 로그인/동의 후 브라우저가 `http://localhost?...` 로 이동하려고 하면, 주소창의 전체 URL을 복사
+5. 그 URL을 SSH 터미널에 붙여넣기
+6. 서버에 `secrets/token.json` 생성 확인
+
+주의:
+
+- 업로드 경로는 브라우저를 띄우지 않습니다.
+- token이 없거나 refresh 실패면 업로드는 즉시 실패하고 `youtube auth`를 다시 실행해야 합니다.
+- cron, systemd, 원격 배포 전에 `youtube auth`를 1회 선행해야 합니다.
+## 6) 출력 계약
 
 - `render`와 `queue run`은 단일 행 `RESULT ...`를 유지합니다.
 - 생성 단계 명령도 성공 시 단일 행 `RESULT status=ok ...`를 출력합니다.
 - 실패 시 traceback 대신 `ERROR ...`와 `RESULT status=error ...`를 출력합니다.
 - `render --traceback`으로만 traceback 출력
 
-## 6) 산출물
+## 7) 산출물
 
 - 기본 출력 디렉터리: `output/`
 - 렌더 결과:
@@ -135,7 +171,7 @@ python -m shorts pipeline daily --config ENV --count 1 --no-upload
 - `jobs/failed`
 - `jobs/work`
 
-## 7) 스케줄링
+## 8) 스케줄링
 
 Linux/WSL cron:
 

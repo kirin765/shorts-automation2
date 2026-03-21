@@ -8,7 +8,17 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
-from . import providers, runner
+from . import runner, upload
+
+
+class _LazyProviders:
+    def __getattr__(self, name: str):
+        from . import providers as _providers
+
+        return getattr(_providers, name)
+
+
+providers = _LazyProviders()
 from .config import ENV_SENTINEL, Config, load_config
 from .models import (
     append_topics_text,
@@ -239,6 +249,15 @@ def build_parser() -> argparse.ArgumentParser:
     jobs_package.add_argument("--queue-dir")
     jobs_package.set_defaults(func=_cmd_jobs_package)
 
+    youtube_parser = subparsers.add_parser("youtube")
+    youtube_subparsers = youtube_parser.add_subparsers(dest="youtube_command")
+    youtube_subparsers.required = True
+    youtube_auth = youtube_subparsers.add_parser("auth")
+    youtube_auth.add_argument("--config", default=ENV_SENTINEL)
+    youtube_auth.add_argument("--authorization-response")
+    youtube_auth.add_argument("--force", action="store_true")
+    youtube_auth.set_defaults(func=_cmd_youtube_auth)
+
     render_parser = subparsers.add_parser("render")
     render_parser.add_argument("--config", default=ENV_SENTINEL)
     render_parser.add_argument("--job", required=True)
@@ -371,6 +390,18 @@ def _cmd_jobs_package(args: argparse.Namespace) -> int:
     )
     print("Enqueued: %s" % path)
     print("RESULT status=ok command=jobs.package output=%s" % one_line(str(path)))
+    return 0
+
+
+def _cmd_youtube_auth(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    token_file, mode = upload.youtube_authenticate(
+        config,
+        authorization_response=args.authorization_response,
+        force=args.force,
+    )
+    print("YouTube token ready: %s" % token_file)
+    print("RESULT status=ok command=youtube.auth token_file=%s mode=%s" % (one_line(str(token_file)), mode))
     return 0
 
 

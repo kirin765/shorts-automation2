@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from . import captions, media, providers, upload
+from . import captions, media, upload
 from .config import Config
 from .models import load_render_job
 from .output import env_truthy, format_result_line, one_line, print_summary
@@ -79,6 +79,8 @@ def run_render_job_file(
         if (not external_audio) and config.render.subtitle_align_openai:
             try:
                 print("[2-1/4] OpenAI subtitle alignment")
+                from . import providers
+
                 providers.write_srt_aligned_openai(
                     config,
                     audio_path=audio,

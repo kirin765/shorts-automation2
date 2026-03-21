@@ -14,4 +14,5 @@ python -m pip install -U pip
 pip install -r requirements.txt
 
 echo "[3/3] Done"
-echo "Try: . .venv/bin/activate && python -m shorts render --config ENV --job jobs/today.json --no-upload"
+echo "Next: . .venv/bin/activate && python -m shorts youtube auth --config ENV"
+echo "Then: python -m shorts render --config ENV --job jobs/today.json --no-upload"

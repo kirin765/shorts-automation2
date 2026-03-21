@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import textwrap
 from dataclasses import dataclass
@@ -27,6 +28,10 @@ class ReviewFeedback:
     fact_check_points: list[str]
     review_notes: list[str]
     rewrite_instructions: list[str]
+
+
+class OpenAIResponseFormatError(RuntimeError):
+    pass
 
 
 def openai_api_key(config: Config) -> str:
@@ -57,8 +62,7 @@ def generate_topic_pool(
         temperature=config.content.openai_topic_temperature,
         max_output_tokens=config.content.openai_topic_max_output_tokens,
     )
-    data = _responses_request(config, key, payload)
-    obj = _decode_output_json(data)
+    obj = _responses_request_json(config, key, payload)
     seen = set()
     existing_set = set(existing)
     candidates = []
@@ -98,8 +102,7 @@ def evaluate_topic_pool(config: Config, topic_pool: TopicPool, *, select_count: 
         temperature=config.content.openai_topic_temperature,
         max_output_tokens=config.content.openai_topic_max_output_tokens,
     )
-    data = _responses_request(config, key, payload)
-    obj = _decode_output_json(data)
+    obj = _responses_request_json(config, key, payload)
     candidates_by_id = {item.candidate_id: item for item in topic_pool.candidates}
     selected = []
     for raw in obj.get("evaluations") or []:
@@ -184,8 +187,7 @@ def generate_script_package(config: Config, selected_topic: SelectedTopic) -> Sc
         temperature=config.content.openai_temperature,
         max_output_tokens=config.content.openai_max_output_tokens,
     )
-    data = _responses_request(config, key, payload)
-    obj = _decode_output_json(data)
+    obj = _responses_request_json(config, key, payload)
     return ScriptPackage.from_dict(
         {
             "run_id": selected_topic.run_id,
@@ -211,8 +213,7 @@ def review_script_package(config: Config, script_package: ScriptPackage) -> Revi
         temperature=config.content.openai_temperature,
         max_output_tokens=config.content.openai_max_output_tokens,
     )
-    data = _responses_request(config, key, payload)
-    obj = _decode_output_json(data)
+    obj = _responses_request_json(config, key, payload)
     return _review_feedback_from_dict(obj)
 
 
@@ -232,8 +233,7 @@ def rewrite_script_package(config: Config, script_package: ScriptPackage, review
         temperature=config.content.openai_temperature,
         max_output_tokens=config.content.openai_max_output_tokens,
     )
-    data = _responses_request(config, key, payload)
-    obj = _decode_output_json(data)
+    obj = _responses_request_json(config, key, payload)
     return ScriptPackage.from_dict(
         {
             "run_id": script_package.run_id,
@@ -566,7 +566,82 @@ def _responses_request(config: Config, api_key: str, payload: dict[str, Any]) ->
     return response.json()
 
 
+def _responses_request_json(
+    config: Config,
+    api_key: str,
+    payload: dict[str, Any],
+    *,
+    max_attempts: int = 2,
+) -> dict[str, Any]:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
+
+    attempt_payload = payload
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        data = _responses_request(config, api_key, attempt_payload)
+        try:
+            return _decode_output_json(data)
+        except OpenAIResponseFormatError as exc:
+            last_exc = exc
+            if attempt >= max_attempts:
+                raise
+            attempt_payload = _build_json_retry_payload(attempt_payload, data)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("OpenAI response retry loop ended unexpectedly")
+
+
+def _build_json_retry_payload(payload: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+    retry_payload = copy.deepcopy(payload)
+    current_tokens = int(retry_payload.get("max_output_tokens") or 0)
+    reason = str(((data.get("incomplete_details") or {}).get("reason")) or "").strip()
+    if current_tokens > 0 and reason == "max_output_tokens":
+        retry_payload["max_output_tokens"] = max(current_tokens + 300, current_tokens * 2)
+    retry_input = list(retry_payload.get("input") or [])
+    retry_input.append(
+        {
+            "role": "system",
+            "content": (
+                "Your previous response was malformed or truncated. "
+                "Return exactly one valid JSON object that matches the schema. "
+                "Do not use markdown fences or any extra text."
+            ),
+        }
+    )
+    retry_payload["input"] = retry_input
+    return retry_payload
+
+
 def _decode_output_json(data: dict[str, Any]) -> dict[str, Any]:
+    text = _extract_output_text(data)
+    if not text:
+        raise OpenAIResponseFormatError("OpenAI response did not include output text.")
+    cleaned = _normalize_output_json_text(text)
+    try:
+        obj = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        candidate = _extract_json_object_candidate(cleaned)
+        if candidate is not None:
+            try:
+                obj = json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+            else:
+                if not isinstance(obj, dict):
+                    raise OpenAIResponseFormatError("OpenAI response JSON must be an object.")
+                return obj
+        raise OpenAIResponseFormatError(
+            "OpenAI response did not contain valid JSON: %s" % exc
+        ) from exc
+    if not isinstance(obj, dict):
+        raise OpenAIResponseFormatError("OpenAI response JSON must be an object.")
+    return obj
+
+
+def _extract_output_text(data: dict[str, Any]) -> str:
+    if isinstance(data.get("output_text"), str) and data.get("output_text", "").strip():
+        return str(data["output_text"])
     text = None
     for item in data.get("output", []) or []:
         for content in item.get("content", []) or []:
@@ -575,9 +650,27 @@ def _decode_output_json(data: dict[str, Any]) -> dict[str, Any]:
                 break
         if text:
             break
-    if not text:
-        raise RuntimeError("OpenAI response did not include output text.")
-    obj = json.loads(text)
-    if not isinstance(obj, dict):
-        raise RuntimeError("OpenAI response JSON must be an object.")
-    return obj
+    return text or ""
+
+
+def _normalize_output_json_text(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[0].strip().lower() == "json":
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    return cleaned
+
+
+def _extract_json_object_candidate(text: str) -> Optional[str]:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    candidate = text[start : end + 1].strip()
+    return candidate or None
