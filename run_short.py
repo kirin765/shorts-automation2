@@ -18,6 +18,9 @@ from urllib.parse import quote_plus
 
 from config_loader import ENV_SENTINEL, load_config
 
+import logging
+logger = logging.getLogger(__name__)
+
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 
@@ -40,8 +43,11 @@ class Job:
     ab_winner: str | None = None
 
 
-def run(cmd: list[str]) -> None:
-    result = subprocess.run(cmd, capture_output=True, text=True)
+def run(cmd: list[str], timeout: int = 300) -> None:
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Command timed out after {timeout}s: {' '.join(cmd)}")
     if result.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{result.stderr}")
 
@@ -92,21 +98,6 @@ def probe_duration(path: Path, *, ffprobe: str = "ffprobe") -> float:
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     return float(result.stdout.strip())
-
-
-def split_for_captions(text: str) -> list[str]:
-    clean = re.sub(r"\s+", " ", text).strip()
-    chunks = re.split(r"(?<=[.!?])\s+", clean)
-    out: list[str] = []
-    for c in chunks:
-        c = c.strip()
-        if not c:
-            continue
-        if len(c) > 28:
-            out.extend(textwrap.wrap(c, width=26, break_long_words=False))
-        else:
-            out.append(c)
-    return out
 
 
 def split_for_captions_dense(text: str, *, max_chars: int = 22) -> list[str]:
@@ -179,17 +170,17 @@ def _coerce_int(
         n = int(value)
     except (TypeError, ValueError):
         if key is not None:
-            print(f"[-] Invalid numeric config '{key}'={value!r}; using default {default}.")
+            logger.warning("Invalid numeric config '%s'=%r; using default %d", key, value, default)
         return default
 
     if n < min_value:
         if key is not None:
-            print(f"[-] Config '{key}'={n} is below minimum ({min_value}); using default {default}.")
+            logger.warning("Config '%s'=%d is below minimum (%d); using default %d", key, n, min_value, default)
         return default
 
     if max_value is not None and n > max_value:
         if key is not None:
-            print(f"[-] Config '{key}'={n} is above maximum ({max_value}); using max {max_value}.")
+            logger.warning("Config '%s'=%d is above maximum (%d); using max %d", key, n, max_value, max_value)
         return max_value
 
     return n
@@ -200,7 +191,7 @@ def _coerce_float(value, *, default: float, key: str | None = None) -> float:
         return float(value)
     except (TypeError, ValueError):
         if key is not None:
-            print(f"[-] Invalid numeric config '{key}'={value!r}; using default {default}.")
+            logger.warning("Invalid numeric config '%s'=%r; using default %g", key, value, default)
         return default
 
 
@@ -238,7 +229,7 @@ def _cleanup_paths(paths: Iterable[Path], *, preserve: set[Path] | None = None) 
         try:
             path.unlink(missing_ok=True)
         except Exception as e:
-            print(f"[-] Failed to remove temporary artifact {path}: {_one_line(str(e))}")
+            logger.warning("Failed to remove temporary artifact %s: %s", path, _one_line(str(e)))
 
 
 def _is_sample_output_dir(path: Path) -> bool:
@@ -249,21 +240,21 @@ def _is_sample_output_dir(path: Path) -> bool:
 def _normalize_subtitle_position(value) -> str:
     normalized = str(value or "").strip().lower()
     if not normalized:
-        print("[-] subtitle_position is empty. Falling back to center,middle.")
+        logger.warning("subtitle_position is empty. Falling back to center,middle.")
         return "center,middle"
 
     parts = [p.strip() for p in normalized.split(",")]
     if len(parts) != 2:
-        print(f"[-] Invalid subtitle_position '{normalized}'. Falling back to center,middle.")
+        logger.warning("Invalid subtitle_position '%s'. Falling back to center,middle.", normalized)
         return "center,middle"
 
     horizontal, vertical = parts
     if horizontal not in {"left", "center", "right"}:
-        print(f"[-] Invalid subtitle horizontal position '{horizontal}'. Falling back to center,middle.")
+        logger.warning("Invalid subtitle horizontal position '%s'. Falling back to center,middle.", horizontal)
         return "center,middle"
 
     if vertical not in {"top", "middle", "bottom"}:
-        print(f"[-] Invalid subtitle vertical position '{vertical}'. Falling back to center,middle.")
+        logger.warning("Invalid subtitle vertical position '%s'. Falling back to center,middle.", vertical)
         return "center,middle"
 
     return f"{horizontal},{vertical}"
@@ -450,11 +441,11 @@ def _repair_srt_timing(
         entries = _read_srt_timing_lines(path)
         raw = path.read_text(encoding="utf-8", errors="ignore").splitlines()
     except Exception as e:
-        print(f"[-] subtitle repair parse failed ({label}): {e}")
+        logger.warning("subtitle repair parse failed (%s): %s", label, e)
         return False
 
     if not entries:
-        print(f"[-] subtitle repair failed ({label}): no timing entries found")
+        logger.warning("subtitle repair failed (%s): no timing entries found", label)
         return False
 
     starts = [start for _, start, _ in entries]
@@ -505,7 +496,7 @@ def _repair_srt_timing(
     try:
         path.write_text("\n".join(fixed_lines), encoding="utf-8")
     except Exception as e:
-        print(f"[-] Failed to write repaired subtitles ({label}): {e}")
+        logger.error("Failed to write repaired subtitles (%s): %s", label, e)
         return False
 
     final_drift = abs(last_end - audio_duration)
@@ -528,30 +519,33 @@ def _validate_srt_timing(
     try:
         entries = _read_srt_timing_lines(path)
     except Exception as e:
-        print(f"[-] Invalid subtitle timing ({e}); file={path}")
+        logger.warning("Invalid subtitle timing (%s); file=%s", e, path)
         return False
 
     if not entries:
-        print(f"[-] Invalid subtitle timing: no usable cues found (file={path})")
+        logger.warning("Invalid subtitle timing: no usable cues found (file=%s)", path)
         return False
 
     first_start = entries[0][1]
     last_end = entries[-1][2]
 
     if max_first_start_s is not None and max_first_start_s >= 0 and first_start > max_first_start_s:
-        print(
-            f"[-] Subtitle timing invalid: first cue starts too late ({first_start:.2f}s > "
-            f"{max_first_start_s:.2f}s) for {label} (file={path})"
+        logger.warning(
+            "Subtitle timing invalid: first cue starts too late (%.2fs > %.2fs) for %s (file=%s)",
+            first_start, max_first_start_s, label, path,
         )
         return False
 
     if last_end <= 0:
-        print(f"[-] Subtitle timing invalid: last_end={last_end:.2f} (file={path})")
+        logger.warning("Subtitle timing invalid: last_end=%.2f (file=%s)", last_end, path)
         return False
 
     drift = abs(last_end - audio_duration)
     if drift > max_drift:
-        print(f"[-] Subtitle timing drift={drift:.2f}s exceeded threshold ({max_drift}s). file={path}, audio={audio_duration:.2f}, last_end={last_end:.2f}")
+        logger.warning(
+            "Subtitle timing drift=%.2fs exceeded threshold (%gs). file=%s, audio=%.2f, last_end=%.2f",
+            drift, max_drift, path, audio_duration, last_end,
+        )
         return False
 
     return True
@@ -576,7 +570,7 @@ def _apply_srt_timing_guard(
             max_scale_delta=max_scale_delta,
             label=label,
         ):
-            print(f"[-] {label} subtitle repair failed; moving to fallback.")
+            logger.warning("%s subtitle repair failed; moving to fallback.", label)
             return False
 
     return _validate_srt_timing(
@@ -814,7 +808,7 @@ def write_srt_aligned_openai(
     def emit_script_subtitles() -> None:
         # Use original script for on-screen text, but keep Whisper timing windows.
         # Split more aggressively for a "Shorts" pacing.
-        lines = split_for_captions_dense(script_text or "", max_chars=max_chars) or split_for_captions(script_text or "")
+        lines = split_for_captions_dense(script_text or "", max_chars=max_chars) or split_for_captions_dense(script_text or "", max_chars=28)
         if not windows:
             raise RuntimeError("no timing windows produced")
         if not lines:
@@ -2479,7 +2473,7 @@ def _normalize_upload_targets(config: dict) -> list[str]:
         elif name in {"tt", "tik", "tiktok", "tik_tok"}:
             name = "tiktok"
         elif name not in {"youtube", "tiktok"}:
-            print(f"[-] Unsupported upload target '{name}'; skipping.")
+            logger.warning("Unsupported upload target '%s'; skipping.", name)
             continue
         if name not in out:
             out.append(name)
@@ -2835,7 +2829,7 @@ def _log_error_event(config: dict[str, Any], payload: dict[str, Any]) -> None:
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
-        print(f"[-] Failed to write error log {path}: {_one_line(str(e))}")
+        logger.error("Failed to write error log %s: %s", path, _one_line(str(e)))
 
 
 def _format_openclaw_message(*, status: str, job: str, error_type: str, error: str, result_line: str | None, log_file: Path | None) -> str:
@@ -2877,18 +2871,18 @@ def _notify_openclaw(message: str, *, config: dict[str, Any]) -> None:
     try:
         cmd = shlex.split(cmd_raw)
     except Exception as e:
-        print(f"[-] openclaw notify command parse failed: {_one_line(str(e))}")
+        logger.warning("openclaw notify command parse failed: %s", _one_line(str(e)))
         return
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=float(timeout_s))
     except Exception as e:
-        print(f"[-] openclaw notify command failed: {_one_line(str(e))}")
+        logger.warning("openclaw notify command failed: %s", _one_line(str(e)))
         return
 
     if result.returncode != 0:
         err = _one_line(result.stderr or result.stdout or "")
-        print(f"[-] openclaw notify command returned non-zero ({result.returncode}): {err}")
+        logger.warning("openclaw notify command returned non-zero (%d): %s", result.returncode, err)
 
 
 
@@ -3036,7 +3030,8 @@ def format_result_line(
     elif upload_url:
         parts.append(f"upload={upload_url}")
     if upload_results:
-        parts.append(f"uploads={json.dumps(upload_results, ensure_ascii=False, separators=(",", ":"))}")
+        _uploads_str = json.dumps(upload_results, ensure_ascii=False, separators=(",", ":"))
+        parts.append(f"uploads={_uploads_str}")
     if upload_failures:
         parts.append(
             "upload_failures="
@@ -3141,7 +3136,7 @@ def main() -> int:
             print("[1/4] TTS generate")
             tts_provider = (config.get("tts_provider") or "elevenlabs").lower()
             if tts_provider != "elevenlabs":
-                print(f"[-] tts_provider={tts_provider!r} is not supported. Forcing ElevenLabs-only mode.")
+                logger.warning("tts_provider=%r is not supported. Forcing ElevenLabs-only mode.", tts_provider)
 
             api_key = config.get("elevenlabs_api_key") or os.environ.get("ELEVENLABS_API_KEY")
             voice_id = config.get("elevenlabs_voice_id") or os.environ.get("ELEVENLABS_VOICE_ID")
@@ -3257,14 +3252,14 @@ def main() -> int:
                         f"fallback will be used."
                     )
             except Exception as e:
-                print(f"[-] OpenAI subtitle alignment failed: {e}")
+                logger.warning("OpenAI subtitle alignment failed: %s", e)
 
         # 2) Final fallback: script split aligned only by script duration.
         if not subtitle_ok:
             try:
                 print("[2-2/4] Script-based subtitle fallback")
                 max_chars = _coerce_int(config.get("subtitle_max_chars"), default=26, key="subtitle_max_chars", min_value=4)
-                lines = split_for_captions_dense(job.script or "", max_chars=max_chars) or split_for_captions(job.script or "")
+                lines = split_for_captions_dense(job.script or "", max_chars=max_chars) or split_for_captions_dense(job.script or "", max_chars=28)
                 write_srt(lines, duration, srt)
                 if _apply_srt_timing_guard(
                     srt,
@@ -3556,8 +3551,9 @@ def main() -> int:
                         try:
                             artifact.unlink(missing_ok=True)
                         except Exception as e:
-                            print(f"[-] Failed to remove temporary artifact {artifact}: {_one_line(str(e))}")
+                            logger.warning("Failed to remove temporary artifact %s: %s", artifact, _one_line(str(e)))
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     raise SystemExit(main())
